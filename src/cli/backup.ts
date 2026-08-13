@@ -18,9 +18,10 @@
  *
  * `--full` additionally includes the plaintext secrets: google-tokens.json,
  * the sidecar signing keys, and the keychain pair (.secrets.enc/.secrets.key)
- * that holds the LLM provider credentials — so a restore works without
- * re-connecting anything. That is the variant hosting backups use; the
- * default keeps the archive far less sensitive for user-facing downloads.
+ * that holds the LLM provider credentials and the STT/TTS API keys — so a
+ * restore works without re-connecting anything. That is the variant hosting
+ * backups use; the default keeps the archive far less sensitive for
+ * user-facing downloads (the DB it carries has no API key in it).
  *
  * Restore is stop-before-restore: it acquires the daemon's own flock (which
  * is JARVIS_HOME-aware, same resolution the daemon uses) plus the data dir's,
