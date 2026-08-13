@@ -26,6 +26,7 @@ import {
   configureLLMTiers,
 } from '../llm/config-binding.ts';
 import { isAnthropicCustomBaseUrl } from '../llm/anthropic.ts';
+import { GROQ_DEPRECATED_MODEL_REPLACEMENTS } from '../llm/groq-models.ts';
 
 // ── DB keys ──────────────────────────────────────────────────────────────
 const SETTING_PROVIDERS = 'llm.providers';
@@ -253,6 +254,10 @@ export function saveLLMSettings(
     }
   }
 
+  // Repair old Groq references before the updated providers are reloaded.
+  // No persist: the block below writes default + tiers to the DB anyway.
+  migrateDeprecatedGroqModels(config, false);
+
   // Persist non-secret state to DB. CRITICAL: strip api_key from every
   // provider entry before serializing - the in-memory entries carry secrets
   // injected from the keychain (see mergeLLMSettingsIntoConfig), and the
@@ -304,7 +309,10 @@ export function stripSecretsFromProviders(
  * pre-rework installs and migrates them in-memory so users upgrading don't
  * lose their saved credentials.
  */
-export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
+export function mergeLLMSettingsIntoConfig(
+  config: JarvisConfig,
+  options: { persistMigrations?: boolean } = {},
+): void {
   // Replace, don't merge: the DB is authoritative for every LLM setting.
   config.llm.providers = {};
   config.llm.tiers = {};
@@ -349,6 +357,7 @@ export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
   // are present and no new-shape providers exist for them. This is the
   // upgrade path for installs that pre-date the provider/model split.
   migrateLegacyDBSettings(config);
+  migrateDeprecatedGroqModels(config, options.persistMigrations !== false);
 
   // 3. Pull API keys from the keychain into provider entries. We do NOT
   // surface them in `config.llm.providers.<name>.api_key` (that would risk
@@ -365,6 +374,45 @@ export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
       config.llm.providers[name] = { ...config.llm.providers[name], api_key: key };
     }
   }
+}
+
+/** Replace known retired Groq IDs before runtime starts. */
+function migrateDeprecatedGroqModels(config: JarvisConfig, persist = true): void {
+  const migrateRef = (ref: string | undefined): string | undefined => {
+    if (!ref) return ref;
+    const separator = ref.indexOf(':');
+    if (separator <= 0) return ref;
+    const providerName = ref.slice(0, separator);
+    const entry = config.llm.providers?.[providerName];
+    if ((entry?.kind ?? providerName) !== 'groq') return ref;
+    const replacement = GROQ_DEPRECATED_MODEL_REPLACEMENTS[ref.slice(separator + 1)];
+    return replacement ? `${providerName}:${replacement}` : ref;
+  };
+
+  let changed = false;
+  const nextDefault = migrateRef(config.llm.default);
+  if (nextDefault !== config.llm.default) {
+    config.llm.default = nextDefault;
+    changed = true;
+  }
+  for (const tier of ['conversation', 'high', 'medium', 'low'] as const) {
+    const current = config.llm.tiers?.[tier];
+    const next = migrateRef(current);
+    if (next !== current) {
+      if (next) config.llm.tiers![tier] = next;
+      changed = true;
+    }
+  }
+  if (!changed) return;
+
+  if (!persist) return;
+
+  setSetting(SETTING_DEFAULT, config.llm.default ?? '');
+  setSetting(SETTING_TIER_CONVERSATION, config.llm.tiers?.conversation ?? '');
+  setSetting(SETTING_TIER_HIGH, config.llm.tiers?.high ?? '');
+  setSetting(SETTING_TIER_MEDIUM, config.llm.tiers?.medium ?? '');
+  setSetting(SETTING_TIER_LOW, config.llm.tiers?.low ?? '');
+  console.log('[LLM] Migrated deprecated Groq model references to supported replacements.');
 }
 
 /**
