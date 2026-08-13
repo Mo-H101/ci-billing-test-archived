@@ -24,8 +24,6 @@ import { cc } from 'bun:ffi';
 import flockSource from './flock.c' with { type: 'file' };
 
 const JARVIS_DIR = join(homedir(), '.jarvis');
-const LOG_DIR = join(JARVIS_DIR, 'logs');
-const LOG_PATH = join(LOG_DIR, 'jarvis.log');
 
 /**
  * The daemon's own root: `JARVIS_HOME` when set (hosted wrappers export it for
@@ -240,6 +238,59 @@ export function releaseLock(): void {
 }
 
 /**
+ * Remove the lockfile ONLY if no process currently holds the flock.
+ * Returns true when the lock is free afterwards (cleared, or never there).
+ *
+ * Callers that stop the daemon need "is it safe to unlink this file", and
+ * neither `isProcessAlive` nor `isLocked` answers that correctly:
+ *
+ *  - a pid check misses a supervisor relaunch (launchd KeepAlive, systemd
+ *    Restart) that put a NEW process behind the same lock;
+ *  - `isLocked` returns null for "held but the pid is unreadable" — the lock
+ *    file is empty for an instant during acquireLock's truncate→write, and
+ *    unreadable entirely if it belongs to another user — which would read as
+ *    "free" and unlink a live holder's lock.
+ *
+ * This asks the only authoritative question (can I take the flock?) and does
+ * the unlink WHILE HOLDING it, so no acquirer can slip into the gap between
+ * the check and the removal.
+ */
+export function releaseLockIfUnheld(): boolean {
+  // We hold it ourselves — the normal release path already handles that.
+  if (lockFd !== null) {
+    releaseLock();
+    return true;
+  }
+
+  const lockPath = defaultLockPath();
+  if (!existsSync(lockPath)) return true;
+
+  let fd: number;
+  try {
+    fd = openSync(lockPath, constants.O_RDONLY);
+  } catch {
+    // Can't even open it (e.g. EACCES on another user's file) — treat as held,
+    // never as free.
+    return false;
+  }
+
+  try {
+    const flock = getFlock();
+    if (flock.do_flock(fd, LOCK_EX | LOCK_NB) !== 0) {
+      closeSync(fd);
+      return false; // someone holds it
+    }
+    try { unlinkSync(lockPath); } catch { /* already gone */ }
+    flock.do_flock(fd, LOCK_UN);
+    closeSync(fd);
+    return true;
+  } catch {
+    try { closeSync(fd); } catch { /* already closed */ }
+    return false;
+  }
+}
+
+/**
  * Read the PID from the lock file. Returns null if no file or invalid content.
  *
  * Lock file format (either form is accepted):
@@ -312,17 +363,64 @@ export function getPidPath(): string {
 
 /**
  * Get the log file path. Creates the log directory if needed.
+ *
+ * JARVIS_HOME-aware, like the lock path above. These used to be module-level
+ * constants built from homedir() at import time, so on an instance that sets
+ * JARVIS_HOME the daemon locked one root and logged to a different one —
+ * `jarvis logs` then tailed a file the daemon wasn't writing.
  */
 export function getLogPath(): string {
-  mkdirSync(LOG_DIR, { recursive: true });
-  return LOG_PATH;
+  const dir = getLogDir();
+  mkdirSync(dir, { recursive: true });
+  return join(dir, 'jarvis.log');
 }
 
 /**
- * Get the log directory path.
+ * Get the log directory path. Resolved per call — see `daemonRootDir`.
  */
 export function getLogDir(): string {
-  return LOG_DIR;
+  return join(daemonRootDir(), 'logs');
+}
+
+/**
+ * Is `pid` still running?
+ *
+ * EPERM means the process EXISTS but isn't ours to signal (a daemon running as
+ * another user) — that is ALIVE. Only ESRCH means "no such process". Getting
+ * this backwards is dangerous: callers use it to decide whether it's safe to
+ * clear the lockfile, and reporting a live daemon as dead lets a second one
+ * start against the same data dir.
+ *
+ * Lives here, next to the lock, because every caller that asks "is the daemon
+ * alive" is really asking "is it safe to touch its lock" — and three separate
+ * copies of this check had already drifted apart.
+ */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+/**
+ * Poll until `pid` is gone, or the budget runs out. Returns true if it exited.
+ *
+ * Needed after SIGKILL: the signal returns before the kernel finishes tearing
+ * the process down, and a killed-but-unreaped zombie still answers kill(pid, 0).
+ */
+export async function waitForProcessExit(
+  pid: number,
+  timeoutMs: number,
+  pollIntervalMs = 50,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+  return !isProcessAlive(pid);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

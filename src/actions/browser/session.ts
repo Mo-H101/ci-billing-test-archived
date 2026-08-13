@@ -243,10 +243,76 @@ export class BrowserController {
       console.warn(`[BrowserController] Page load timeout for ${url}, continuing anyway`);
     }
 
-    // Wait for JS to settle
-    await Bun.sleep(800);
+    await this.waitForSettled();
 
     return this.snapshot();
+  }
+
+  /**
+   * Wait for the document to stop changing, bounded.
+   *
+   * This replaces a flat `Bun.sleep(800)`. That sleep was wrong in both
+   * directions: on a static page it burned 800ms doing nothing, and on a loaded
+   * machine — or when the load-event wait above timed out and we continued
+   * anyway — 800ms wasn't enough, so callers got a snapshot of a page whose
+   * scripts hadn't run yet (missing elements, unattached listeners).
+   *
+   * Polls readyState plus the element count and returns as soon as two
+   * consecutive samples agree, so the common case is FASTER than the old sleep
+   * while a slow page gets up to `maxMs`.
+   *
+   * A failed sample is RETRIED rather than treated as terminal. Chrome rejects
+   * Runtime.evaluate with "Cannot find context with specified id" while the
+   * execution context is being swapped — i.e. exactly during the navigation we
+   * are waiting on. Bailing on the first such error would end the wait after a
+   * single tick and hand back a page whose scripts have not run, which is worse
+   * than the flat sleep this replaced. Only a sustained run of failures (a
+   * crashed tab, a closed target) ends the wait early.
+   */
+  private async waitForSettled(maxMs = 3000, intervalMs = 150, minSettleMs = 800): Promise<void> {
+    const start = Date.now();
+    const deadline = start + maxMs;
+    const maxConsecutiveFailures = 5;
+    let lastCount = -1;
+    let failures = 0;
+
+    while (Date.now() < deadline) {
+      await Bun.sleep(intervalMs);
+
+      let sample: string | null = null;
+      try {
+        const result = await this.cdp.send('Runtime.evaluate', {
+          expression: `(() => {
+            try { return document.readyState + ':' + document.getElementsByTagName('*').length; }
+            catch { return 'error:-1'; }
+          })()`,
+          returnByValue: true,
+        });
+        if (!result.exceptionDetails && result.result?.value !== undefined) {
+          sample = String(result.result.value);
+        }
+      } catch {
+        // Transient during a context swap — fall through to the retry counter.
+      }
+
+      const count = sample === null ? Number.NaN : Number.parseInt(sample.split(':')[1] ?? '', 10);
+      if (sample === null || Number.isNaN(count)) {
+        if (++failures >= maxConsecutiveFailures) return;
+        continue;
+      }
+      failures = 0;
+
+      // A stable element count is the settle signal, floored at minSettleMs for
+      // EVERY page — `readyState === 'complete'` is not a licence to return
+      // early. Plenty of pages build their DOM from a load handler or a short
+      // setTimeout, which run AFTER 'complete'; returning at ~300ms would
+      // snapshot them empty, a regression against the flat 800ms sleep this
+      // replaced. The floor keeps the old guarantee; the stability check is
+      // what lets a slow page take longer, up to maxMs.
+      const stable = count === lastCount;
+      if (stable && Date.now() - start >= minSettleMs) return;
+      lastCount = count;
+    }
   }
 
   /**
