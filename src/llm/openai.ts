@@ -107,11 +107,22 @@ type OpenAIStreamChunk = {
   }>;
 };
 
+export function formatOpenAIHttpError(status: number, contentType: string | null, body: string): string {
+  const trimmed = body.trim();
+  if (contentType?.toLowerCase().includes('text/html') || /^<!doctype html|^<html/i.test(trimmed)) {
+    const title = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.trim();
+    return `HTTP ${status}: ${title || 'the server returned an HTML page instead of an OpenAI-compatible API response'}`;
+  }
+  const compact = trimmed.replace(/\s+/g, ' ');
+  return `HTTP ${status}${compact ? `: ${compact.slice(0, 500)}${compact.length > 500 ? '…' : ''}` : ''}`;
+}
+
 export class OpenAIProvider implements LLMProvider {
   name = 'openai';
   protected apiKey: string;
   protected defaultModel: string;
   protected baseUrl: string;
+  protected authHeader: string;
   protected get apiUrl(): string {
     return `${this.baseUrl}/chat/completions`;
   }
@@ -122,10 +133,37 @@ export class OpenAIProvider implements LLMProvider {
     return 'OpenAI';
   }
 
-  constructor(apiKey: string, defaultModel = 'gpt-4o', baseUrl = 'https://api.openai.com/v1') {
+  constructor(apiKey: string, defaultModel = 'gpt-4o', baseUrl = 'https://api.openai.com/v1', authHeader = 'Authorization') {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
     this.baseUrl = baseUrl.replace(/\/$/, '');
+    // `||` not the default param alone: a stored empty string would otherwise
+    // survive and produce a nameless header that fetch rejects at runtime.
+    this.authHeader = authHeader || 'Authorization';
+  }
+
+  protected requestHeaders(includeContentType = true): Record<string, string> {
+    const headers: Record<string, string> = includeContentType ? { 'Content-Type': 'application/json' } : {};
+    if (this.apiKey) {
+      headers[this.authHeader] = this.authHeader.toLowerCase() === 'authorization'
+        ? `Bearer ${this.apiKey}`
+        : this.apiKey;
+    }
+    return headers;
+  }
+
+  /**
+   * `base` lets a subclass aim one request at an alternate root without
+   * touching shared state. Passing it explicitly (rather than swapping
+   * `this.baseUrl` around the call) is what keeps concurrent requests from
+   * reading each other's root.
+   */
+  protected postChat(body: Record<string, unknown>, base = this.baseUrl): Promise<Response> {
+    return fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: this.requestHeaders(),
+      body: JSON.stringify(body),
+    });
   }
 
   async chat(messages: LLMMessage[], options: LLMOptions = {}): Promise<LLMResponse> {
@@ -149,20 +187,11 @@ export class OpenAIProvider implements LLMProvider {
       body.tool_choice = tool_choice || 'auto';  // Enable tool calling
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
-
-    const response = await fetch(this.apiUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
+    const response = await this.postChat(body);
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`${this.errorLabel} API error (${response.status}): ${errorText}`);
+      throw new Error(`${this.errorLabel} API error: ${formatOpenAIHttpError(response.status, response.headers.get('content-type'), errorText)}`);
     }
 
     const data = await response.json() as OpenAIResponse;
@@ -191,22 +220,13 @@ export class OpenAIProvider implements LLMProvider {
       body.tool_choice = tool_choice || 'auto';  // Enable tool calling
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
-
-    const response = await fetch(this.apiUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
+    const response = await this.postChat(body);
 
     if (!response.ok) {
       const errorText = await response.text();
       yield {
         type: 'error',
-        error: `${this.errorLabel} API error (${response.status}): ${errorText}`,
+        error: `${this.errorLabel} API error: ${formatOpenAIHttpError(response.status, response.headers.get('content-type'), errorText)}`,
         code: classifyHttpStatus(response.status),
       };
       return;
@@ -319,8 +339,7 @@ export class OpenAIProvider implements LLMProvider {
 
   async listModels(): Promise<string[]> {
     try {
-      const headers: Record<string, string> = {};
-      if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+      const headers = this.requestHeaders(false);
       const response = await fetch(this.modelsUrl, { headers });
 
       if (!response.ok) {

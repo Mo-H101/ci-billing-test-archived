@@ -20,6 +20,7 @@ import type { JarvisConfig, LLMProviderEntry, LLMProviderKind } from '../config/
 import { getSetting, setSetting } from '../vault/settings.ts';
 import { getSecret, setSecret, deleteSecret, hasSecret } from '../vault/keychain.ts';
 import type { LLMManager } from '../llm/manager.ts';
+import type { LLMProvider } from '../llm/provider.ts';
 import {
   instantiateProvider,
   atomicReloadProviders,
@@ -56,11 +57,33 @@ function normalizeBaseUrl(value: string | undefined): string {
   return value?.trim().replace(/\/+$/, '') ?? '';
 }
 
+/** RFC 7230 `token` - the only characters legal in an HTTP header name. */
+const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/**
+ * Normalize a caller-supplied auth header name, or throw if it isn't a legal
+ * header name. Both the save and the test path go through here so the two
+ * boundaries can't disagree about what they accept - a rejected name must
+ * produce the same message whether you clicked Save or Test.
+ *
+ * Returns undefined for a blank value, which clears the field and hands the
+ * provider back its own default.
+ */
+function validateAuthHeader(value: string, providerName: string): string | undefined {
+  const header = value.trim();
+  if (!header) return undefined;
+  if (!HEADER_NAME_RE.test(header)) {
+    throw new Error(`Provider '${providerName}' has an invalid auth header name`);
+  }
+  return header;
+}
+
 // ── Types exposed to the dashboard ───────────────────────────────────────
 export type LLMSettingsProviderView = {
   kind: LLMProviderKind;
   has_api_key: boolean;
   base_url?: string;
+  auth_header?: string;
 };
 
 export type LLMMode = 'single' | 'multi-tier';
@@ -94,6 +117,7 @@ export type LLMSettingsRequest = {
     kind?: LLMProviderKind;
     api_key?: string;
     base_url?: string;
+    auth_header?: string;
   } | null>;            // null deletes the provider
   default?: string | null;     // null clears
   mode?: LLMMode;              // persisted architecture choice
@@ -130,6 +154,7 @@ export function getLLMSettings(config: JarvisConfig): LLMSettingsResponse {
       kind,
       has_api_key: hasSecret(keychainKey(name)) || Boolean(entry.api_key),
       ...(entry.base_url ? { base_url: entry.base_url } : {}),
+      ...(entry.auth_header ? { auth_header: entry.auth_header } : {}),
     };
   }
 
@@ -234,6 +259,9 @@ export function saveLLMSettings(
       const merged: LLMProviderEntry = { ...existing };
       if (update.kind !== undefined) merged.kind = update.kind;
       if (update.base_url !== undefined) merged.base_url = update.base_url;
+      if (update.auth_header !== undefined) {
+        merged.auth_header = validateAuthHeader(update.auth_header, name);
+      }
       // api_key is persisted to the keychain only - never store the plaintext
       // back into the config object that might end up on disk.
       if (update.api_key !== undefined) {
@@ -586,6 +614,76 @@ export function hotReloadLLMProviders(config: JarvisConfig, llmManager: LLMManag
 // ── testLLMProvider ──────────────────────────────────────────────────────
 
 /**
+ * How many catalog models one connection test may probe before giving up.
+ *
+ * Each probe is a real, billable chat request and gateways fronting many
+ * upstreams routinely advertise catalogs in the hundreds, so the walk has to
+ * stop somewhere. Note this bounds MODELS, not HTTP requests: a provider that
+ * resolves among several roots may spend more than one request per probe.
+ */
+const MAX_TEST_MODEL_PROBES = 10;
+
+/**
+ * Longest error text worth pattern-matching. The classifiers below use
+ * `[\s\S]*`, which is quadratic on a non-matching subject, and an upstream
+ * error body can be arbitrarily long — a gateway returning a megabyte of HTML
+ * would otherwise stall the daemon's single event loop for seconds.
+ */
+const MAX_CLASSIFIED_ERROR_CHARS = 2000;
+
+/**
+ * A rejection that names a model is worth stepping past: gateway catalogs are
+ * commonly a superset of what one credential may actually use. Matches both
+ * spaced and underscored wordings (`not found`, `not_found_error`,
+ * `model_not_found`) since each gateway phrases it differently.
+ */
+const MODEL_SCOPED_FAILURE =
+  /model[\s\S]*(not[ _]?allowed|not[ _]?found|unavailable|denied)|not[ _]?allowed[\s\S]*model/i;
+
+/**
+ * On a routed gateway a single upstream can be down for one model only.
+ *
+ * Deliberately excludes 404: a 404 that is genuinely about the model says so
+ * in words and is caught above, whereas a bare 404 means the ROUTE is wrong —
+ * and walking ten models against a wrong route just multiplies the failure.
+ */
+const TRANSIENT_UPSTREAM_FAILURE = /HTTP (502|503|504)\b/i;
+
+/**
+ * Send the test prompt to each candidate model until one answers.
+ *
+ * Stops immediately on anything that isn't model-scoped — a bad key, a
+ * network failure, or a malformed request must surface as itself rather than
+ * being buried under N retries against other models.
+ */
+async function probeUsableModel(
+  instance: LLMProvider,
+  models: string[],
+  allowTransientUpstream: boolean,
+): Promise<{ model: string } | { lastError: string; probed: number }> {
+  const candidates = models.slice(0, MAX_TEST_MODEL_PROBES);
+  let lastError = '';
+  let probed = 0;
+
+  for (const candidate of candidates) {
+    probed++;
+    try {
+      await instance.chat([{ role: 'user', content: 'Say OK' }], { max_tokens: 5, model: candidate });
+      return { model: candidate };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      lastError = message;
+      const classified = message.slice(0, MAX_CLASSIFIED_ERROR_CHARS);
+      const recoverable = MODEL_SCOPED_FAILURE.test(classified)
+        || (allowTransientUpstream && TRANSIENT_UPSTREAM_FAILURE.test(classified));
+      if (!recoverable) throw err;
+    }
+  }
+
+  return { lastError, probed };
+}
+
+/**
  * Test a provider's credentials by instantiating it and sending a one-token
  * chat. Uses the supplied credentials if given, otherwise the current config.
  *
@@ -601,6 +699,7 @@ export async function testLLMProvider(
     provider?: string;
     api_key?: string;
     base_url?: string;
+    auth_header?: string;
     model?: string;
   },
   config: JarvisConfig,
@@ -651,10 +750,23 @@ export async function testLLMProvider(
   const apiKey = opts.api_key ?? storedApiKey;
   const baseUrl = hasExplicitBaseUrl ? requestedBaseUrl : configuredBaseUrl;
 
+  // Same validation as the save path - a test must not be able to smuggle in
+  // a header name that Save would have rejected. Report it as a failed test
+  // rather than letting it escape as a 'malformed body' from the route.
+  let authHeader: string | undefined;
+  try {
+    authHeader = opts.auth_header !== undefined
+      ? validateAuthHeader(opts.auth_header, name)
+      : configured?.auth_header;
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+
   const entry: LLMProviderEntry = {
     kind,
     ...(apiKey ? { api_key: apiKey } : {}),
     ...(baseUrl ? { base_url: baseUrl } : {}),
+    ...(authHeader ? { auth_header: authHeader } : {}),
   };
 
   const instance = instantiateProvider(name, entry);
@@ -670,7 +782,26 @@ export async function testLLMProvider(
       if (!models.length) {
         return { ok: false, error: 'Could not discover any models from the custom Anthropic endpoint' };
       }
-      testModel = models[0];
+      const probe = await probeUsableModel(instance, models, false);
+      if ('model' in probe) return { ok: true, model: probe.model, models };
+      return {
+        ok: false,
+        error: `The custom Anthropic endpoint listed ${models.length} models, but this credential could not use any of the ${probe.probed} tried${probe.lastError ? `: ${probe.lastError}` : ''}`,
+        models,
+      };
+    }
+    if (kind === 'openai_compatible' && !testModel) {
+      models = await instance.listModels();
+      if (!models.length) {
+        return { ok: false, error: 'The OpenAI-compatible endpoint did not return any models from /v1/models' };
+      }
+      const probe = await probeUsableModel(instance, models, true);
+      if ('model' in probe) return { ok: true, model: probe.model, models };
+      return {
+        ok: false,
+        error: `The OpenAI-compatible endpoint listed models, but none of the first ${probe.probed} accepted a test request${probe.lastError ? `: ${probe.lastError}` : ''}`,
+        models,
+      };
     }
     const resp = await instance.chat(
       [{ role: 'user', content: 'Say OK' }],

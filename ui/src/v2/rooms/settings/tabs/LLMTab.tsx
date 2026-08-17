@@ -9,6 +9,7 @@ import {
   OPTIONAL_KEY_KINDS,
   OPTIONAL_BASE_URL_KINDS,
   URL_BASED_KINDS,
+  sendsAuthHeader,
   type LLMConfigProviderView,
   type LLMProviderKind,
   type LLMTier,
@@ -325,6 +326,7 @@ function ProviderRow({
 
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(entry.base_url ?? "");
+  const [authHeader, setAuthHeader] = useState(entry.auth_header ?? "Authorization");
   const [customEndpoint, setCustomEndpoint] = useState(optionalUrl && Boolean(entry.base_url));
   const supportsUrl = usesUrl || (optionalUrl && customEndpoint);
   const [testing, setTesting] = useState(false);
@@ -338,15 +340,25 @@ function ProviderRow({
   const endpointChanged = (usesUrl || optionalUrl)
     && entry.has_api_key
     && effectiveBaseUrl !== normalizeBaseUrl(entry.base_url ?? "");
+  // The header choice only exists for a keyed provider on a custom endpoint.
+  // Everywhere else the provider picks its own header, and sending one anyway
+  // would override that — so Test and Save must agree on this single gate.
+  const sendsHeader = sendsAuthHeader(entry.kind, supportsUrl);
+  const authHeaderChanged = sendsHeader
+    && authHeader !== (entry.auth_header ?? "Authorization");
 
   useEffect(() => {
     setBaseUrl(entry.base_url ?? "");
     setCustomEndpoint(optionalUrl && Boolean(entry.base_url));
   }, [entry.base_url, optionalUrl]);
 
+  useEffect(() => {
+    setAuthHeader(entry.auth_header ?? "Authorization");
+  }, [entry.auth_header]);
+
   // A test verdict describes the inputs it ran with — editing any of them
   // invalidates it (mirrors the onboarding wizard).
-  useEffect(() => { setTestResult(null); }, [apiKey, baseUrl, customEndpoint]);
+  useEffect(() => { setTestResult(null); }, [apiKey, baseUrl, customEndpoint, authHeader]);
 
   return (
     <div className={"v2-set__provider-row " + (expanded ? "v2-set__provider-row--open" : "")}>
@@ -423,6 +435,15 @@ function ProviderRow({
               )}
             </div>
           )}
+          {sendsHeader && (
+            <div className="v2-set__field">
+              <label className="v2-set__field-label">Authentication header</label>
+              <select className="v2-set__select" value={authHeader} onChange={(e) => setAuthHeader(e.target.value)}>
+                <option value="Authorization">Authorization: Bearer</option>
+                <option value="x-api-key">x-api-key</option>
+              </select>
+            </div>
+          )}
 
           <div className="v2-set__row-actions" style={{ display: "flex", gap: "var(--s-2)", marginTop: "var(--s-3)" }}>
             <button
@@ -440,6 +461,7 @@ function ProviderRow({
                   baseUrl: optionalUrl
                     ? (customEndpoint ? baseUrl : "")
                     : (baseUrl || undefined),
+                  ...(sendsHeader ? { authHeader } : {}),
                 });
                 setTestResult({ ok: r.ok, text: r.message, models: r.models });
                 setTesting(false);
@@ -453,12 +475,13 @@ function ProviderRow({
               disabled={saving
                 || (customEndpoint && !baseUrl.trim())
                 || (endpointChanged && !apiKey)
-                || (!apiKey && baseUrl === (entry.base_url ?? ""))}
+                || (!apiKey && baseUrl === (entry.base_url ?? "") && !authHeaderChanged)}
               onClick={async () => {
                 setSaving(true);
-                const input: { kind?: LLMProviderKind; api_key?: string; base_url?: string } = {};
+                const input: { kind?: LLMProviderKind; api_key?: string; base_url?: string; auth_header?: string } = {};
                 if (apiKey) input.api_key = apiKey;
                 if (usesUrl || optionalUrl) input.base_url = supportsUrl ? baseUrl : "";
+                if (sendsHeader) input.auth_header = authHeader;
                 const r = await data.upsertProvider(name, input);
                 onToast(r.message, r.ok ? "ok" : "warn");
                 if (r.ok) setApiKey("");
@@ -509,6 +532,7 @@ function NewProviderRow({
   const [kind, setKind] = useState<LLMProviderKind>("anthropic");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  const [authHeader, setAuthHeader] = useState("Authorization");
   const [customEndpoint, setCustomEndpoint] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string; models?: string[] } | null>(null);
@@ -519,6 +543,9 @@ function NewProviderRow({
   const supportsUrl = usesUrl || (optionalUrl && customEndpoint);
   const usesKey = KEY_BASED_KINDS.has(kind);
   const needsKey = usesKey && !OPTIONAL_KEY_KINDS.has(kind);
+  // Same gate as ProviderRow: only override the provider's own header choice
+  // when the user actually had a dropdown to make that choice with.
+  const sendsHeader = sendsAuthHeader(kind, supportsUrl);
   // Suggest name = kind unless user typed something
   const effectiveName = name.trim() || kind;
   const duplicate = existing.includes(effectiveName);
@@ -615,6 +642,15 @@ function NewProviderRow({
             )}
           </div>
         )}
+        {sendsHeader && (
+          <div className="v2-set__field">
+            <label className="v2-set__field-label">Authentication header</label>
+            <select className="v2-set__select" value={authHeader} onChange={(e) => setAuthHeader(e.target.value)}>
+              <option value="Authorization">Authorization: Bearer</option>
+              <option value="x-api-key">x-api-key</option>
+            </select>
+          </div>
+        )}
         </div>
 
         <div className="v2-set__row-actions" style={{ display: "flex", gap: "var(--s-2)", marginTop: "var(--s-3)" }}>
@@ -632,6 +668,7 @@ function NewProviderRow({
                 kind,
                 apiKey: apiKey || undefined,
                 baseUrl: supportsUrl ? baseUrl || undefined : undefined,
+                ...(sendsHeader ? { authHeader } : {}),
               });
               setTestResult({ ok: result.ok, text: result.message, models: result.models });
               setTesting(false);
@@ -645,9 +682,10 @@ function NewProviderRow({
             disabled={saving || duplicate || (needsKey && !apiKey) || (usesUrl && !baseUrl) || (customEndpoint && !baseUrl)}
             onClick={async () => {
               setSaving(true);
-              const input: { kind: LLMProviderKind; api_key?: string; base_url?: string } = { kind };
+              const input: { kind: LLMProviderKind; api_key?: string; base_url?: string; auth_header?: string } = { kind };
               if (apiKey) input.api_key = apiKey;
               if (baseUrl) input.base_url = baseUrl;
+              if (sendsHeader) input.auth_header = authHeader;
               const r = await data.upsertProvider(effectiveName, input);
               onToast(r.message, r.ok ? "ok" : "warn");
               setSaving(false);
