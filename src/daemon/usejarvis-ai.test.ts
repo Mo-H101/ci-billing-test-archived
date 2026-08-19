@@ -88,6 +88,20 @@ describe('applyUsejarvisAi (provider injection only)', () => {
     applyUsejarvisAi(twice);
     expect(twice.llm).toEqual(once.llm);
   });
+
+  test('testLLMProvider refuses the reserved name (key-exfiltration guard)', async () => {
+    const { testLLMProvider } = await import('./llm-settings.ts');
+    const config = hosted();
+    applyUsejarvisAi(config);
+    // A kind/base_url override would otherwise inherit the hosted key and
+    // send it to an attacker-chosen endpoint.
+    const result = await testLLMProvider(
+      { name: USEJARVIS_PROVIDER_NAME, kind: 'openai_compatible', base_url: 'https://evil.example' },
+      config,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('system-managed');
+  });
 });
 
 describe('effectiveLlmForBinding (per-slot: explicit ref → llm.default → plan alias)', () => {
@@ -231,12 +245,44 @@ describe('DB round-trips (restart survival + fill never persists)', () => {
     expect(hasSecret('llm.provider.atomicity-probe.api_key')).toBe(false);
     expect(config.llm.providers!['atomicity-probe']).toEqual({ kind: 'anthropic' });
 
-    // Self-hosted installs keep the legacy silent skip (no block, no throw).
+    // Self-hosted installs have NO reservation: a provider that happens to
+    // carry the name is user property and saves like any other entry (the
+    // old silent skip destroyed legacy configs named usejarvis_ai).
     const selfHosted = base();
     selfHosted.llm.providers = {};
     expect(() =>
       saveLLMSettings(selfHosted, { providers: { [USEJARVIS_PROVIDER_NAME]: { kind: 'openai' } } }),
     ).not.toThrow();
-    expect(selfHosted.llm.providers[USEJARVIS_PROVIDER_NAME]).toBeUndefined();
+    expect(selfHosted.llm.providers[USEJARVIS_PROVIDER_NAME]).toEqual({ kind: 'openai' });
+  });
+});
+
+describe('hasUsejarvisAi: malformed blocks read as NOT hosted, never fatal', () => {
+  const withBlock = (block: unknown): JarvisConfig => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    (config as Record<string, unknown>).usejarvis_ai = block;
+    return config;
+  };
+
+  // YAML types its scalars: an unquoted `api_key: 1234567890` parses as a
+  // number, and `.trim()` on it threw out of here, through
+  // mergeLLMSettingsIntoConfig, into the boot try/catch → exit(1). A hand-
+  // edited config must degrade to self-hosted, not stop the daemon booting.
+  test('a numeric api_key or base_url does not throw', () => {
+    expect(() => hasUsejarvisAi(withBlock({ base_url: 'https://x', api_key: 1234567890 }))).not.toThrow();
+    expect(hasUsejarvisAi(withBlock({ base_url: 'https://x', api_key: 1234567890 }))).toBe(false);
+    expect(hasUsejarvisAi(withBlock({ base_url: 42, api_key: 'sk-uj-abc' }))).toBe(false);
+  });
+
+  test('other malformed shapes are also non-fatal and non-hosted', () => {
+    for (const block of [null, undefined, 'a string', [], { base_url: 'https://x' }, { api_key: 'sk-uj-a' },
+                         { base_url: '   ', api_key: 'sk-uj-a' }, { base_url: true, api_key: false }]) {
+      expect(() => hasUsejarvisAi(withBlock(block))).not.toThrow();
+      expect(hasUsejarvisAi(withBlock(block))).toBe(false);
+    }
+  });
+
+  test('a well-formed block still reads as hosted', () => {
+    expect(hasUsejarvisAi(withBlock({ base_url: 'https://llm.usejarvis.host', api_key: 'sk-uj-abc' }))).toBe(true);
   });
 });

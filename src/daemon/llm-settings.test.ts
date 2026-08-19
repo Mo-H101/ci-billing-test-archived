@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, test } from 'bun:test';
 import { initDatabase, closeDb } from '../vault/schema.ts';
 import { getSetting, setSetting } from '../vault/settings.ts';
 import { DEFAULT_CONFIG, type JarvisConfig } from '../config/types.ts';
-import { mergeLLMSettingsIntoConfig, saveLLMSettings } from './llm-settings.ts';
+import { getLLMSettings, mergeLLMSettingsIntoConfig, saveLLMSettings } from './llm-settings.ts';
+import { applyUsejarvisAi, USEJARVIS_PROVIDER_NAME } from './usejarvis-ai.ts';
 
 afterEach(() => closeDb());
 
@@ -158,69 +159,131 @@ describe('LLM settings model migrations', () => {
   });
 });
 
-/**
- * `auth_header` is the one part of a provider credential that is NOT a secret,
- * so it rides in the config rather than the keychain. These pin the boundary
- * rules: a legal name persists, a blank clears, and an illegal one is refused
- * before it can reach fetch.
- */
-describe('LLM settings auth header', () => {
-  const withDb = (fn: () => void) => { initDatabase(':memory:'); fn(); };
+function hostedConfig(): JarvisConfig {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.usejarvis_ai = { base_url: 'https://llm.usejarvis.host', api_key: 'sk-uj-LIFETIMEKEY0000000000' };
+  applyUsejarvisAi(config); // what boot / every merge does
+  return config;
+}
 
-  it('persists a valid header name and exposes it back', () => withDb(() => {
-    const config = structuredClone(DEFAULT_CONFIG);
-    saveLLMSettings(config, {
-      providers: { gw: { kind: 'litellm', base_url: 'http://gw.local/v1', auth_header: 'x-api-key' } },
-    });
+describe('saveLLMSettings: the hosted provider is not editable', () => {
+  beforeEach(() => { closeDb(); initDatabase(':memory:'); });
+  afterEach(() => { closeDb(); });
 
-    expect(config.llm.providers?.['gw']?.auth_header).toBe('x-api-key');
-    const stored = JSON.parse(getSetting('llm.providers') ?? '{}') as Record<string, { auth_header?: string }>;
-    expect(stored['gw']?.auth_header).toBe('x-api-key');
-  }));
-
-  it('trims surrounding whitespace', () => withDb(() => {
-    const config = structuredClone(DEFAULT_CONFIG);
-    saveLLMSettings(config, {
-      providers: { gw: { kind: 'litellm', base_url: 'http://gw.local/v1', auth_header: '  x-api-key  ' } },
-    });
-
-    expect(config.llm.providers?.['gw']?.auth_header).toBe('x-api-key');
-  }));
-
-  it('clears the field on a blank value so the provider default applies', () => withDb(() => {
-    const config = structuredClone(DEFAULT_CONFIG);
-    saveLLMSettings(config, {
-      providers: { gw: { kind: 'litellm', base_url: 'http://gw.local/v1', auth_header: 'x-api-key' } },
-    });
-    saveLLMSettings(config, { providers: { gw: { auth_header: '' } } });
-
-    expect(config.llm.providers?.['gw']?.auth_header).toBeUndefined();
-  }));
-
-  it('leaves the stored header alone when the update omits it', () => withDb(() => {
-    const config = structuredClone(DEFAULT_CONFIG);
-    saveLLMSettings(config, {
-      providers: { gw: { kind: 'litellm', base_url: 'http://gw.local/v1', auth_header: 'x-api-key' } },
-    });
-    saveLLMSettings(config, { providers: { gw: { base_url: 'http://gw.local/v1' } } });
-
-    expect(config.llm.providers?.['gw']?.auth_header).toBe('x-api-key');
-  }));
-
-  it('refuses a header name containing CRLF', () => withDb(() => {
-    const config = structuredClone(DEFAULT_CONFIG);
+  // Previously this silently `continue`d and still answered "saved and
+  // applied", so a delete appeared to succeed and the card reappeared on the
+  // next render — the API reported work it had not done.
+  test('refuses an edit rather than silently ignoring it', () => {
+    const config = hostedConfig();
     expect(() => saveLLMSettings(config, {
-      providers: { gw: { kind: 'litellm', base_url: 'http://gw.local/v1', auth_header: 'X-Bad\r\nX-Evil: 1' } },
-    })).toThrow(/invalid auth header name/);
-    expect(config.llm.providers?.['gw']).toBeUndefined();
-  }));
+      providers: { [USEJARVIS_PROVIDER_NAME]: { base_url: 'http://attacker/v1' } },
+    })).toThrow(/managed by your hosting plan/);
+    // The injected entry is untouched by the rejected write.
+    expect(config.llm.providers?.[USEJARVIS_PROVIDER_NAME]?.base_url).toBe('https://llm.usejarvis.host');
+  });
 
-  it('refuses a header name with spaces or a colon', () => withDb(() => {
+  test('refuses a delete too', () => {
+    const config = hostedConfig();
+    expect(() => saveLLMSettings(config, {
+      providers: { [USEJARVIS_PROVIDER_NAME]: null },
+    })).toThrow(/managed by your hosting plan/);
+    expect(config.llm.providers?.[USEJARVIS_PROVIDER_NAME]).toBeDefined();
+  });
+
+  test('an ordinary provider still saves normally', () => {
+    const config = hostedConfig();
+    // The key rides along with the base_url: main's credential-scoping rule
+    // refuses to let a STORED credential follow a provider to a new endpoint,
+    // so a URL change must re-supply it in the same request.
+    saveLLMSettings(config, {
+      providers: { anthropic: { kind: 'anthropic', base_url: 'https://api.anthropic.com', api_key: 'sk-ant-user' } },
+    });
+    expect(config.llm.providers?.anthropic?.kind).toBe('anthropic');
+  });
+
+  // The security invariant: the per-account key must never reach the DB.
+  test('a save on a hosted install leaves the reserved name out of the settings table', () => {
+    const config = hostedConfig();
+    saveLLMSettings(config, { prompt_cache: false });
+    const stored = getSetting('llm.providers') ?? '{}';
+    expect(stored).not.toContain(USEJARVIS_PROVIDER_NAME);
+    expect(stored).not.toContain('sk-uj-');
+    expect(stored).not.toContain('llm.usejarvis.host');
+  });
+});
+
+describe('getLLMSettings: the block is reported, never exposed', () => {
+  beforeEach(() => { closeDb(); initDatabase(':memory:'); });
+  afterEach(() => { closeDb(); });
+
+  test('reports hosted_llm without any credential or endpoint material', () => {
+    const view = getLLMSettings(hostedConfig());
+    expect(view.hosted_llm).toBe(true);
+    // Surfaced as a managed flag only — not as an editable provider entry.
+    expect(view.providers[USEJARVIS_PROVIDER_NAME]).toBeUndefined();
+    const serialized = JSON.stringify(view);
+    expect(serialized).not.toContain('sk-uj-');
+    expect(serialized).not.toContain('llm.usejarvis.host');
+  });
+
+  test('a self-hosted install reports hosted_llm false', () => {
+    expect(getLLMSettings(structuredClone(DEFAULT_CONFIG)).hosted_llm).toBe(false);
+  });
+});
+
+describe('getLLMSettings.effective: the dashboard reads routing reality, not a re-derivation', () => {
+  beforeEach(() => { closeDb(); initDatabase(':memory:'); });
+  afterEach(() => { closeDb(); });
+
+  test('hosted + everything silent: router-first on the four plan aliases, sourced "plan"', () => {
+    const config = hostedConfig();
+    const { effective } = getLLMSettings(config);
+    expect(effective.mode).toBe('router-first');
+    expect(effective.tiers.conversation).toEqual({ ref: 'usejarvis_ai:uj-chat', source: 'plan' });
+    expect(effective.tiers.high).toEqual({ ref: 'usejarvis_ai:uj-high', source: 'plan' });
+    expect(effective.tiers.medium).toEqual({ ref: 'usejarvis_ai:uj-medium', source: 'plan' });
+    expect(effective.tiers.low).toEqual({ ref: 'usejarvis_ai:uj-low', source: 'plan' });
+    // ...while the persisted view stays pure user intent (all null).
+    expect(getLLMSettings(config).tiers.high).toBeNull();
+  });
+
+  test('hosted + llm.default set: per-slot D1 resolution, explicit choice wins its slot', () => {
+    const config = hostedConfig();
+    config.llm.default = 'anthropic:claude-x';
+    config.llm.tiers = { high: 'usejarvis_ai:uj-high' };
+    const { effective } = getLLMSettings(config);
+    expect(effective.tiers.high).toEqual({ ref: 'usejarvis_ai:uj-high', source: 'choice' });
+    expect(effective.tiers.medium).toEqual({ ref: 'anthropic:claude-x', source: 'default' });
+    expect(effective.tiers.conversation).toEqual({ ref: 'anthropic:claude-x', source: 'default' });
+  });
+
+  test('self-hosted: effective mirrors the persisted refs, silent slots stay empty', () => {
     const config = structuredClone(DEFAULT_CONFIG);
-    for (const bad of ['has space', 'has:colon']) {
-      expect(() => saveLLMSettings(config, {
-        providers: { gw: { kind: 'litellm', base_url: 'http://gw.local/v1', auth_header: bad } },
-      })).toThrow(/invalid auth header name/);
-    }
-  }));
+    config.llm.tiers = { high: 'anthropic:claude-x' };
+    const { effective } = getLLMSettings(config);
+    expect(effective.mode).toBe('single'); // no conversation tier bound
+    expect(effective.tiers.high).toEqual({ ref: 'anthropic:claude-x', source: 'choice' });
+    expect(effective.tiers.low).toEqual({ ref: null, source: null });
+  });
+});
+
+describe('self-hosted installs with a legacy provider literally named usejarvis_ai (W10)', () => {
+  beforeEach(() => { closeDb(); initDatabase(':memory:'); });
+  afterEach(() => { closeDb(); });
+
+  test('the entry survives an unrelated save, stays listed, and hosted_llm stays false', () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.llm.providers = { usejarvis_ai: { kind: 'openai_compatible', base_url: 'https://my.gw/v1' } };
+    saveLLMSettings(config, { prompt_cache: false });
+    // Persisted, not dropped:
+    expect(getSetting('llm.providers') ?? '').toContain('usejarvis_ai');
+    // Still visible to the dashboard, and the install does not read as hosted:
+    const view = getLLMSettings(config);
+    expect(view.providers.usejarvis_ai).toBeDefined();
+    expect(view.hosted_llm).toBe(false);
+    // Reload keeps it (no reserved-name skip on self-hosted):
+    const reloaded = structuredClone(DEFAULT_CONFIG);
+    mergeLLMSettingsIntoConfig(reloaded);
+    expect(reloaded.llm.providers?.usejarvis_ai?.base_url).toBe('https://my.gw/v1');
+  });
 });

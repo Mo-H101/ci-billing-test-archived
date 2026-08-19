@@ -113,8 +113,36 @@ export type LLMSettingsResponse = {
   };
   /** Provider classes the system can instantiate. UI dropdowns use this. */
   available_kinds: LLMProviderKind[];
+  /** True on hosted installs (the system-owned usejarvis_ai block is live). */
+  hosted_llm?: boolean;
   /** Provider-side prompt caching. Defaults to true; only explicit false disables. */
   prompt_cache: boolean;
+  /**
+   * What the daemon is ACTUALLY routing with, computed from the same
+   * effectiveLlmForBinding view the provider-binding paths consume. The
+   * `tiers`/`mode`/`default` fields above are persisted user intent; this is
+   * the resolved result after hosted per-slot filling. The dashboard renders
+   * hints and fallback labels from HERE, never by re-deriving the fill —
+   * re-derivation is how the UI and the daemon ended up contradicting each
+   * other (pr2 review #3B, pr7 review #2).
+   */
+  effective: LLMSettingsEffectiveView;
+};
+
+/** Where an effective tier ref came from. */
+export type EffectiveTierSource =
+  | 'choice'   // the user's explicit tier ref
+  | 'default'  // filled from llm.default (per-slot, hosted installs)
+  | 'plan';    // filled from the plan's uj-* alias
+
+export type LLMSettingsEffectiveView = {
+  /** Architecture actually bound: router-first iff the effective view has a
+   * conversation tier (the same rule configureLLMTiers applies). */
+  mode: 'single' | 'router-first';
+  tiers: Record<Tier, {
+    ref: string | null;
+    source: EffectiveTierSource | null;
+  }>;
 };
 
 /** Body shape accepted by saveLLMSettings - all fields optional/partial. */
@@ -155,6 +183,12 @@ export function getLLMSettings(config: JarvisConfig): LLMSettingsResponse {
   const providers: Record<string, LLMSettingsProviderView> = {};
   for (const [name, entry] of Object.entries(config.llm.providers ?? {})) {
     if (!entry) continue;
+    // The injected hosted provider is SYSTEM-owned: not editable, and its
+    // base_url/key presence are none of the dashboard's business. It is
+    // surfaced separately as a managed flag below. Hosted-gated: a
+    // self-hosted install whose user happened to name a provider
+    // `usejarvis_ai` before the reservation existed still owns that entry.
+    if (name === USEJARVIS_PROVIDER_NAME && hasUsejarvisAi(config)) continue;
     const kind = (entry.kind ?? name) as LLMProviderKind;
     providers[name] = {
       kind,
@@ -183,6 +217,27 @@ export function getLLMSettings(config: JarvisConfig): LLMSettingsResponse {
         ? 'multi-tier'
         : 'single';
 
+  // The resolved routing view, from the same function the binding paths use.
+  const bound = effectiveLlmForBinding(config);
+  const effectiveTiers = {} as LLMSettingsEffectiveView['tiers'];
+  for (const tier of TIERS) {
+    const chosen = config.llm.tiers?.[tier];
+    if (chosen) {
+      effectiveTiers[tier] = { ref: chosen, source: 'choice' };
+      continue;
+    }
+    const resolved = bound.tiers?.[tier] ?? null;
+    effectiveTiers[tier] = resolved
+      ? { ref: resolved, source: config.llm.default ? 'default' : 'plan' }
+      : { ref: null, source: null };
+  }
+  const effective: LLMSettingsEffectiveView = {
+    // Same rule configureLLMTiers applies: a conversation tier in the BOUND
+    // view activates router-first, whatever the stored mode label says.
+    mode: effectiveTiers.conversation.ref ? 'router-first' : 'single',
+    tiers: effectiveTiers,
+  };
+
   return {
     providers,
     default: config.llm.default ?? null,
@@ -190,6 +245,12 @@ export function getLLMSettings(config: JarvisConfig): LLMSettingsResponse {
     tiers,
     available_kinds: AVAILABLE_KINDS,
     prompt_cache: config.llm.prompt_cache !== false,
+    effective,
+    // Hosted installs: tells the dashboard to render the read-only
+    // "included with your plan" card (no base_url, no key material).
+    // Derived from the config.yaml block — the single source of hostedness —
+    // never from provider-map key presence, which a legacy row can fake.
+    hosted_llm: hasUsejarvisAi(config),
   };
 }
 
@@ -217,15 +278,13 @@ export function saveLLMSettings(
       // SYSTEM-owned: on hosted installs an edit/delete of the reserved name
       // is refused loudly (a silent skip reported "saved" for a no-op). The
       // throw lives HERE in the validation loop so a rejected batch mutates
-      // nothing. On self-hosted installs (no block) the legacy silent-skip
-      // stands until the reservation is gated on hostedness.
-      if (name === USEJARVIS_PROVIDER_NAME) {
-        if (hasUsejarvisAi(config)) {
-          throw new Error(
-            `Provider '${USEJARVIS_PROVIDER_NAME}' is managed by your hosting plan and cannot be edited or deleted`,
-          );
-        }
-        continue;
+      // nothing. On self-hosted installs there is no reservation: a legacy
+      // provider that happens to carry the name falls through to the normal
+      // validation and save path like any other entry.
+      if (name === USEJARVIS_PROVIDER_NAME && hasUsejarvisAi(config)) {
+        throw new Error(
+          `Provider '${USEJARVIS_PROVIDER_NAME}' is managed by your hosting plan and cannot be edited or deleted`,
+        );
       }
       if (update === null) continue;
       const existing = config.llm.providers[name] ?? {};
@@ -257,10 +316,10 @@ export function saveLLMSettings(
       }
     }
     for (const [name, update] of updates) {
-      // The hosted provider is SYSTEM-owned (config.yaml carve-out): the
-      // dashboard can neither create, edit, nor delete it, and nothing under
-      // the reserved name may reach the DB or keychain.
-      if (name === USEJARVIS_PROVIDER_NAME) continue;
+      // Hosted installs never reach here with the reserved name — the
+      // validation loop above already threw. Defensive skip in case the two
+      // loops ever drift apart; on self-hosted the entry is a normal provider.
+      if (name === USEJARVIS_PROVIDER_NAME && hasUsejarvisAi(config)) continue;
       if (update === null) {
         delete config.llm.providers[name];
         // Drop every model ref the provider owned. The manager prunes its own
@@ -334,7 +393,9 @@ export function saveLLMSettings(
   // provider entry before serializing - the in-memory entries carry secrets
   // injected from the keychain (see mergeLLMSettingsIntoConfig), and the
   // settings table is plaintext.
-  setSetting(SETTING_PROVIDERS, JSON.stringify(stripSecretsFromProviders(config.llm.providers)));
+  setSetting(SETTING_PROVIDERS, JSON.stringify(
+    stripSecretsFromProviders(config.llm.providers, { hosted: hasUsejarvisAi(config) }),
+  ));
   setSetting(SETTING_DEFAULT, config.llm.default ?? '');
   setSetting(SETTING_TIER_CONVERSATION, config.llm.tiers.conversation ?? '');
   setSetting(SETTING_TIER_HIGH, config.llm.tiers.high ?? '');
@@ -355,14 +416,18 @@ export function saveLLMSettings(
  */
 export function stripSecretsFromProviders(
   providers: Record<string, LLMProviderEntry> | undefined,
+  options: { hosted?: boolean } = {},
 ): Record<string, LLMProviderEntry> {
   const out: Record<string, LLMProviderEntry> = {};
   for (const [name, entry] of Object.entries(providers ?? {})) {
     if (!entry) continue;
-    // The hosted provider is INJECTED from config.yaml on every merge — it
-    // must never round-trip into the persisted DB shape (it would survive
-    // un-hosting and shadow the file as a stale copy).
-    if (name === USEJARVIS_PROVIDER_NAME) continue;
+    // On hosted installs the reserved provider is INJECTED from config.yaml
+    // on every merge — it must never round-trip into the persisted DB shape
+    // (it would survive un-hosting and shadow the file as a stale copy). On
+    // self-hosted installs a legacy provider carrying the name is user
+    // property and persists like any other (dropping it silently destroyed
+    // the entry plus its refs on the next boot).
+    if (name === USEJARVIS_PROVIDER_NAME && options.hosted !== false) continue;
     const { api_key: _omit, ...rest } = entry;
     void _omit;
     out[name] = rest;
@@ -404,6 +469,10 @@ export function mergeLLMSettingsIntoConfig(
     try {
       const parsed = JSON.parse(providersJson) as Record<string, LLMProviderEntry>;
       for (const [name, entry] of Object.entries(parsed)) {
+        // Hosted installs: a DB row squatting on the reserved name never
+        // loads (applyUsejarvisAi would overwrite it anyway; skipping keeps
+        // the invariant visible). Self-hosted legacy rows load normally.
+        if (name === USEJARVIS_PROVIDER_NAME && hasUsejarvisAi(config)) continue;
         config.llm.providers[name] = entry;
       }
     } catch (err) {
@@ -453,11 +522,13 @@ export function mergeLLMSettingsIntoConfig(
   // surface them in `config.llm.providers.<name>.api_key` (that would risk
   // saving them back to disk) - instead the config-binding module reads
   // from the keychain at provider-instantiation time. So this step only
-  // ensures entries exist for any name with a keychain secret.
+  // ensures entries exist for any name with a keychain secret. (There is no
+  // YAML write path: loader.ts deliberately has no saveConfig.)
   for (const name of Object.keys(config.llm.providers)) {
     // The hosted provider's credential comes from the config.yaml block only;
     // a keychain entry squatting on the reserved name must not shadow it.
-    if (name === USEJARVIS_PROVIDER_NAME) continue;
+    // Self-hosted legacy providers hydrate from the keychain like any other.
+    if (name === USEJARVIS_PROVIDER_NAME && hasUsejarvisAi(config)) continue;
     const key = getSecret(keychainKey(name));
     if (key) {
       // Inject into the entry transiently so registerLLMProviders can
@@ -750,6 +821,14 @@ export async function testLLMProvider(
   // Resolve effective name + kind. Legacy `provider` is treated as `name`.
   const name = opts.name ?? opts.provider ?? opts.kind;
   if (!name) return { ok: false, error: 'provider name required' };
+  // The hosted provider's key must never pass through user hands: a caller
+  // could combine the inherited credential with a kind/base_url OVERRIDE and
+  // exfiltrate it to an arbitrary endpoint. It is system-tested, not
+  // user-tested. (Self-hosted installs have no platform key to protect; a
+  // legacy provider carrying the name is testable like any other.)
+  if (name === USEJARVIS_PROVIDER_NAME && hasUsejarvisAi(config)) {
+    return { ok: false, error: 'usejarvis_ai is system-managed and cannot be tested here' };
+  }
 
   // Look up config entry to inherit settings the caller didn't override.
   const configured = config.llm.providers?.[name];
