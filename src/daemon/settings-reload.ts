@@ -48,6 +48,7 @@ import { applyEnvOverrides } from '../config/loader.ts';
 import { googleTokensPath } from '../integrations/google-auth.ts';
 import { USER_OWNED_SECTIONS, type JarvisConfig, type UserOwnedSection } from '../config/types.ts';
 import { mergeLLMSettingsIntoConfig } from './llm-settings.ts';
+import { clearRealtimeGateCache } from './realtime-gate.ts';
 import { mergeUserSettingsIntoConfig } from './user-settings.ts';
 
 export type ReloadSection = UserOwnedSection | 'llm' | 'google';
@@ -165,6 +166,19 @@ export class SettingsReloadCoordinator {
   }
 
   /**
+   * Runs at the end of every reloadAll — SIGHUP and POST /api/config/reload
+   * take the same path, so cross-cutting refreshes that are NOT per-section
+   * appliers (the pebble realtime re-advertisement, whose trigger is the
+   * SYSTEM-owned usejarvis_ai block that no section applier watches) fire on
+   * both. Errors are logged, never allowed to fail the reload itself.
+   */
+  setPostReloadAll(fn: (() => Promise<void>) | null): void {
+    this.postReloadAll = fn;
+  }
+
+  private postReloadAll: (() => Promise<void>) | null = null;
+
+  /**
    * Fire-and-forget: schedule a coalesced apply for the section. No-op when
    * the section has no appliers. A repeat call while one is pending restarts
    * the debounce timer — appliers read live config, so latest state wins.
@@ -220,6 +234,11 @@ export class SettingsReloadCoordinator {
       mergeUserSettingsIntoConfig(this.config);
       applyEnvOverrides(this.config);
 
+      // A reload is the moment a re-provisioned usejarvis_ai block lands, so
+      // any cached realtime plan verdict is now suspect. Cheap to drop: the
+      // next voice_start re-asks the catalog once and re-caches.
+      clearRealtimeGateCache();
+
       const changed = RELOAD_SECTIONS.filter((s) => this.snapshot(s) !== before.get(s));
       // The hosted deliver/revoke ops write the tokens file and SIGHUP us; the
       // creds in config are untouched, so the section diff above sees nothing.
@@ -237,6 +256,11 @@ export class SettingsReloadCoordinator {
 
       if (changed.length > 0) {
         this.emitBroadcast({ sections: [...changed], ok: errors.length === 0, errors });
+      }
+      try {
+        await this.postReloadAll?.();
+      } catch (err) {
+        console.warn('[SettingsReload] post-reload hook failed:', err);
       }
       return { changed, applied, errors };
     });

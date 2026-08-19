@@ -19,6 +19,7 @@
 import { PebbleAudioTransport } from '../comms/pebble-audio-transport.ts';
 import { RealtimeVoiceSession } from './realtime-voice.ts';
 import type { ResolvedRealtimeVoice } from '../config/realtime.ts';
+import { hostedRealtimeIncluded } from './realtime-gate.ts';
 import type { LLMTool } from '../llm/provider.ts';
 import type { SidecarAudioChannel } from '../sidecar/manager.ts';
 
@@ -47,6 +48,12 @@ export type PebbleRealtimeDeps = {
   onState?: (sidecarId: string, state: PebbleRealtimeState, text?: string) => void;
   /** Surface session lifecycle to logs / the sidecar. */
   onStatus?: (sidecarId: string, status: PebbleRealtimeStatus, detail?: string) => void;
+  /** Re-push the sidecar's `configure_realtime` advertisement. Called when the
+   *  plan gate refuses a start: the advertisement that let the summon key open
+   *  a live session was computed under an advisory-allow (or a stale verdict),
+   *  and re-advertising with the now-cached definitive verdict flips the
+   *  hotkey back to one-shot capture instead of an error dead-end. */
+  readvertise?: (sidecarId: string) => void;
 };
 
 type Entry = {
@@ -99,6 +106,12 @@ export function foldTranscript(
 
 export class PebbleRealtimeManager {
   private sessions = new Map<string, Entry>(); // sidecarId -> entry
+  /** Starts parked on the plan-gate await. `stop()` (summon toggled off, or
+   *  the sidecar disconnected) cancels the token; the start aborts instead of
+   *  opening a perpetual billed session for a peer that already left. Before
+   *  this existed the first await in start() came AFTER sessions.set(), so
+   *  stop() always found the entry — the gate await reopened that window. */
+  private pendingStarts = new Map<string, { cancelled: boolean }>();
 
   constructor(private deps: PebbleRealtimeDeps) {}
 
@@ -109,6 +122,13 @@ export class PebbleRealtimeManager {
   /** Open a perpetual realtime session for this sidecar (idempotent). */
   async start(sidecarId: string): Promise<void> {
     if (this.sessions.has(sidecarId)) return;
+    // A start already parked on the gate await adopts this request: un-cancel
+    // it (covers a quick stop→start toggle) rather than racing a second gate.
+    const parked = this.pendingStarts.get(sidecarId);
+    if (parked) {
+      parked.cancelled = false;
+      return;
+    }
 
     let resolved: ResolvedRealtimeVoice;
     try {
@@ -121,6 +141,27 @@ export class PebbleRealtimeManager {
     } catch (err) {
       this.deps.onStatus?.(sidecarId, 'error', `Realtime resolve failed: ${String(err)}`);
       return;
+    }
+
+    const pending = { cancelled: false };
+    this.pendingStarts.set(sidecarId, pending);
+    try {
+      // Same plan gate as WSService.tryStartRealtimeVoice — without it a hosted
+      // plan that excludes realtime would dial and fail instead of the sidecar
+      // falling back to one-shot capture.
+      if (!(await hostedRealtimeIncluded(resolved))) {
+        this.deps.onStatus?.(sidecarId, 'closed', 'Realtime voice is not included in this plan.');
+        // The summon key only got here because the advertisement said realtime
+        // was on (advisory-allow or a stale verdict). Re-advertise with the
+        // now-cached definitive verdict so the hotkey falls back to one-shot
+        // capture instead of erroring on every press.
+        this.deps.readvertise?.(sidecarId);
+        return;
+      }
+      if (pending.cancelled) return; // stop()/disconnect arrived mid-gate
+      if (this.sessions.has(sidecarId)) return; // re-check across the await
+    } finally {
+      this.pendingStarts.delete(sidecarId);
     }
 
     const transport = new PebbleAudioTransport({
@@ -196,6 +237,10 @@ export class PebbleRealtimeManager {
 
   /** Close the session and return the pebble to idle (idempotent). */
   stop(sidecarId: string): void {
+    // A start parked on the gate await has no session entry yet — cancel the
+    // token so it aborts instead of opening a session for a peer that's gone.
+    const pending = this.pendingStarts.get(sidecarId);
+    if (pending) pending.cancelled = true;
     const entry = this.sessions.get(sidecarId);
     if (!entry) return;
     this.sessions.delete(sidecarId);
