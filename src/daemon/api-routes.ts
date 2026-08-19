@@ -1356,6 +1356,44 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             tts?: Record<string, unknown>;
           };
 
+          // 0. Hosted installs answer LLM/STT/TTS from the platform, so the
+          //    wizard hides those steps and sends no provider config. Enforce
+          //    that HERE rather than trusting the client: a stale cached
+          //    bundle, a replayed request, or curl would otherwise pin the
+          //    account off its own plan — writing llm.default (which makes
+          //    effectiveLlmForBinding bail out and disables all four uj-*
+          //    tiers) or tts.provider (which marks the user as having chosen,
+          //    so the included voice never applies again).
+          //
+          //    `mode` is the one LLM field a hosted install may set: it
+          //    records the architecture choice without naming a provider or a
+          //    model, and without it the settings tab misreports multi-tier
+          //    as single. Everything else is dropped.
+          //    `tts.enabled` is likewise kept: whether the assistant SPEAKS is
+          //    not a provider choice, and dropping it would leave a hosted
+          //    install mute (DEFAULT_CONFIG has it false) while the wizard
+          //    promises the plan includes voice. The provider field is still
+          //    stripped, so the row stays silent and the included uj voice
+          //    applies.
+          // Whatever the guard strips is REPORTED back (`dropped`): a wizard
+          // that raced the hosted probe may have collected provider config
+          // the guard is about to discard — answering plain ok would let it
+          // print "✓ brain · Anthropic" for credentials that were never
+          // saved (review pr7#4).
+          const dropped: string[] = [];
+          if (hasUsejarvisAi(ctx.config)) {
+            const llmBody = body.llm as { mode?: unknown; providers?: unknown; default?: unknown } | undefined;
+            const mode = llmBody?.mode;
+            if (llmBody && (llmBody.providers !== undefined || llmBody.default !== undefined)) dropped.push('llm');
+            body.llm = mode === 'single' || mode === 'multi-tier' ? { mode } : undefined;
+            if (body.stt !== undefined) dropped.push('stt');
+            body.stt = undefined;
+            const ttsBody = body.tts as { enabled?: unknown; provider?: unknown } | undefined;
+            if (ttsBody && Object.keys(ttsBody).some((k) => k !== 'enabled')) dropped.push('tts');
+            const enabled = ttsBody?.enabled;
+            body.tts = typeof enabled === 'boolean' ? { enabled } : undefined;
+          }
+
           // 1. LLM settings — same path as /api/config/llm POST.
           if (body.llm && Object.keys(body.llm).length > 0) {
             const { saveLLMSettings, hotReloadLLMProviders } = await import('./llm-settings.ts');
@@ -1441,6 +1479,9 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             ok: true,
             setup_completed_at: now,
             post_setup_services_started: postSetupStarted,
+            // Sections the hosted guard stripped from this request, so the
+            // wizard can tell the user instead of claiming they were saved.
+            dropped,
             message: 'Setup complete. Jarvis is ready.',
           });
         } catch (err) {
@@ -2410,9 +2451,14 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/channels/status': {
       GET: () => {
         if (!ctx.channelService) return json({ channels: {}, stt: null });
+        // Binding view, like the /api/config/stt GET: after a provider reset
+        // on a hosted install the raw section has no (or an empty sentinel)
+        // provider while transcription runs happily on 'usejarvis' — the raw
+        // read blanked the Channels header on a working install.
+        const sttBinding = effectiveSttForBinding(ctx.config);
         return json({
           channels: ctx.channelService.getChannelStatus(),
-          stt: ctx.config.stt?.provider ?? null,
+          stt: sttBinding?.provider || ctx.config.stt?.provider || null,
         });
       },
     },
@@ -2500,8 +2546,35 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       POST: async (req: Request) => {
         try {
           const body = await req.json() as Record<string, unknown>;
-          const { persistUserPatch } = await import('./user-settings.ts');
+          const { persistUserPatch, clearProviderChoice } = await import('./user-settings.ts');
           const { mergeSTTConfig } = await import('./config-merge.ts');
+
+          // `provider: null` means "reset to the plan default": drop the
+          // recorded choice so the row is silent again and
+          // effectiveSttForBinding fills it with the included uj stack.
+          // Writing 'usejarvis' instead would record a choice and pin them.
+          // Runs BEFORE provider validation: null is a command, not a
+          // provider value. Hosted only: on a self-hosted install there is no
+          // plan default to fall back TO, so clearing the choice would leave
+          // createSTTProvider with nothing to build and silently kill
+          // transcription.
+          if (body.provider === null) {
+            if (!hasUsejarvisAi(ctx.config)) {
+              return error('No plan default to reset to on a self-hosted install');
+            }
+            const cleared = clearProviderChoice('stt');
+            if (!cleared) {
+              return json({ ok: true, message: 'Nothing to reset — no transcription choice is recorded, so your plan default already applies.' });
+            }
+            if (ctx.config.stt) delete (ctx.config.stt as Record<string, unknown>).provider;
+            if (!ctx.settingsReload) {
+              return json({ ok: true, message: 'Reset to your plan default. Restart to apply.' });
+            }
+            const resetErr = await ctx.settingsReload.applyNow('stt');
+            return json(resetErr
+              ? { ok: false, message: `Reset saved, but applying it failed: ${resetErr.error}` }
+              : { ok: true, message: 'Reset to your plan default.' });
+          }
 
           // Validate before anything persists: an unknown provider (or
           // 'usejarvis' on a self-hosted install, where createSTTProvider can
@@ -2581,6 +2654,27 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       POST: async (req: Request) => {
         try {
           const body = await req.json() as Record<string, unknown>;
+          const { persistUserPatch, clearProviderChoice } = await import('./user-settings.ts');
+
+          // `provider: null` resets to the plan default, mirroring the STT
+          // route: a command, handled before provider validation.
+          if (body.provider === null) {
+            if (!hasUsejarvisAi(ctx.config)) {
+              return error('No plan default to reset to on a self-hosted install');
+            }
+            const cleared = clearProviderChoice('tts');
+            if (!cleared) {
+              return json({ ok: true, message: 'Nothing to reset — no voice choice is recorded, so your plan default already applies.' });
+            }
+            if (ctx.config.tts) delete (ctx.config.tts as Record<string, unknown>).provider;
+            if (!ctx.settingsReload) {
+              return json({ ok: true, message: 'Reset to your plan default. Restart to apply.' });
+            }
+            const resetErr = await ctx.settingsReload.applyNow('tts');
+            return json(resetErr
+              ? { ok: false, message: `Reset saved, but applying it failed: ${resetErr.error}` }
+              : { ok: true, message: 'Reset to your plan default.' });
+          }
 
           // Validate the provider before anything persists: an unknown string
           // (or 'usejarvis' on a self-hosted install, where no hosted
@@ -2596,11 +2690,13 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
               return json({ ok: false, error: 'The Usejarvis AI voice is only available on hosted installs; pick edge, elevenlabs or sarvam.' }, 400);
             }
           }
-
-          const { persistUserPatch } = await import('./user-settings.ts');
           const { mergeTTSConfig } = await import('./config-merge.ts');
 
-          // Same discipline as /api/config/stt POST above.
+          // Same discipline as /api/config/stt POST above: single merge,
+          // persist the request patch over the STORED row, publish only after
+          // the persist succeeded. Without patch-over-row persistence, the
+          // "Enable TTS" toggle (whose body carries no explicit choice) would
+          // stamp the DEFAULT provider 'edge' into the row as user intent.
           const merged = mergeTTSConfig(ctx.config.tts, body);
           persistUserPatch('tts', body);
           ctx.config.tts = merged;
