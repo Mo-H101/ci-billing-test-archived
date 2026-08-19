@@ -874,16 +874,22 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // edge-tts / ElevenLabs / Sarvam for TTS) carry over.
       let pebbleSTT: import('../comms/voice.ts').STTProvider | null = null;
       let pebbleTTS: import('../comms/voice.ts').TTSProvider | null = null;
-      if (jarvisConfig.stt) {
-        try {
-          const { createSTTProvider } = await import('../comms/voice.ts');
-          pebbleSTT = createSTTProvider(jarvisConfig.stt);
-          if (pebbleSTT) {
-            console.log(`[ambient-ui] STT provider for pebble: ${jarvisConfig.stt.provider}`);
-          }
-        } catch (err) {
-          console.warn('[ambient-ui] failed to init STT provider:', err);
+      // Guard on the BINDING result, not on config.stt existing (like
+      // channel-service): the hosted default applies even when the section
+      // is absent, and an outer config.stt check would leave pebble STT
+      // dead on a surface where Telegram/Discord transcribe fine.
+      try {
+        const { createSTTProvider } = await import('../comms/voice.ts');
+        const { effectiveSttForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+        const sttBinding = effectiveSttForBinding(jarvisConfig);
+        pebbleSTT = sttBinding
+          ? createSTTProvider(sttBinding, usejarvisVoiceCredentials(jarvisConfig))
+          : null;
+        if (pebbleSTT) {
+          console.log(`[ambient-ui] STT provider for pebble: ${sttBinding!.provider}`);
         }
+      } catch (err) {
+        console.warn('[ambient-ui] failed to init STT provider:', err);
       }
       if (jarvisConfig.tts?.enabled) {
         try {
@@ -903,8 +909,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // the main registration block.
       settingsReload?.registerApplier('stt', async (cfg) => {
         const { createSTTProvider } = await import('../comms/voice.ts');
-        pebbleSTT = cfg.stt ? createSTTProvider(cfg.stt) : null;
-        console.log(`[ambient-ui] STT provider ${pebbleSTT ? `set to ${cfg.stt?.provider}` : 'cleared'} (settings reload)`);
+        const { effectiveSttForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+        const sttBinding = effectiveSttForBinding(cfg);
+        pebbleSTT = sttBinding ? createSTTProvider(sttBinding, usejarvisVoiceCredentials(cfg)) : null;
+        console.log(`[ambient-ui] STT provider ${pebbleSTT ? `set to ${sttBinding?.provider}` : 'cleared'} (settings reload)`);
       });
       settingsReload?.registerApplier('tts', async (cfg) => {
         pebbleTTS = null;
@@ -3586,13 +3594,19 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       }
     }
 
-    // 8d. Wire STT provider for voice input via dashboard
-    if (jarvisConfig.stt) {
+    // 8d. Wire STT provider for voice input via dashboard. Guard on the
+    // BINDING result, not on config.stt existing (like channel-service):
+    // the hosted default applies even when the section is absent.
+    {
       const { createSTTProvider } = await import('../comms/voice.ts');
-      const sttProvider = createSTTProvider(jarvisConfig.stt);
+      const { effectiveSttForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+      const sttBinding = effectiveSttForBinding(jarvisConfig);
+      const sttProvider = sttBinding
+        ? createSTTProvider(sttBinding, usejarvisVoiceCredentials(jarvisConfig))
+        : null;
       if (sttProvider) {
         wsService.setSTTProvider(sttProvider);
-        console.log(`[Daemon] STT for voice input: ${jarvisConfig.stt.provider}`);
+        console.log(`[Daemon] STT for voice input: ${sttBinding!.provider}`);
       }
     }
 
@@ -3665,7 +3679,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // restart when any channel is connected.
     settingsReload.registerApplier('stt', async (cfg) => {
       const { createSTTProvider } = await import('../comms/voice.ts');
-      wsService.setSTTProvider(cfg.stt ? createSTTProvider(cfg.stt) : null);
+      const { effectiveSttForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+      const sttBinding = effectiveSttForBinding(cfg);
+      wsService.setSTTProvider(sttBinding ? createSTTProvider(sttBinding, usejarvisVoiceCredentials(cfg)) : null);
       if (Object.values(channelService.getChannelStatus()).some(Boolean)) {
         settingsReload!.sectionChanged('channels');
       }

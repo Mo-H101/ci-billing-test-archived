@@ -1,4 +1,6 @@
-import type { JarvisConfig, LLMConfig } from '../config/types.ts';
+import type { JarvisConfig, LLMConfig, STTConfig } from '../config/types.ts';
+import type { HostedVoiceCredentials } from '../comms/voice.ts';
+import { loadUserSection } from './user-settings.ts';
 
 /**
  * Hosted "Usejarvis AI" wiring (the platform's LLM proxy).
@@ -166,4 +168,67 @@ export function validateHostedModelRef(model: string): string | null {
     return `Model '${model}' is not a chat alias of your plan`;
   }
   return null;
+}
+
+// ── Hosted voice (STT) ──────────────────────────────────────────────────────
+
+/**
+ * The proxy credentials for the voice provider factories, as a value SEPARATE
+ * from cfg.stt/cfg.tts: those sections persist as plaintext JSON rows in the
+ * DB settings store and round-trip through the /api/config routes, so the
+ * per-account key must never be written into them. Null when self-hosted.
+ */
+export function usejarvisVoiceCredentials(config: JarvisConfig): HostedVoiceCredentials | null {
+  if (!hasUsejarvisAi(config)) return null;
+  const block = config.usejarvis_ai!;
+  return { baseUrl: block.base_url!.trim(), apiKey: block.api_key!.trim() };
+}
+
+/** Provider-specific sub-blocks a stored stt row can carry. */
+const STT_PROVIDER_BLOCKS = ['openai', 'groq', 'local', 'sarvam'] as const;
+
+/**
+ * True when a stored user section records provider intent. An explicit
+ * `provider` string is intent — but so is a row that carries any
+ * provider-specific sub-block without one: importLegacyUserSettings writes
+ * exactly that shape for a config.yaml that had `stt: { openai: {...} }` and
+ * relied on DEFAULT_CONFIG for the provider line. Treating it as silence
+ * silently re-routed that user's audio to the hosted proxy past the key they
+ * configured. (New imports also stamp `provider` explicitly; this keeps rows
+ * imported before that fix honest.)
+ */
+function storedProviderChoice(stored: unknown): boolean {
+  if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) return false;
+  const rec = stored as Record<string, unknown>;
+  if (typeof rec.provider === 'string' && rec.provider.trim() !== '') return true;
+  return STT_PROVIDER_BLOCKS.some(
+    (block) => typeof rec[block] === 'object' && rec[block] !== null,
+  );
+}
+
+/**
+ * The BINDING view of cfg.stt: hosted installs where the user never chose an
+ * STT provider default to the included Usejarvis AI transcription.
+ *
+ * Same persistence-purity rule as effectiveLlmForBinding: the default is
+ * never assigned back onto config.stt, because that object is persisted
+ * verbatim by every /api/config/stt save (mergeSTTConfig merges the patch
+ * over the IN-MEMORY section) and by the voice-command provider switch — a
+ * mutated fill would be recorded as user intent on the next unrelated save.
+ * Consume this at provider-construction time only.
+ *
+ * "User is silent" is judged by the DB row, not by the in-memory value:
+ * after mergeUserSettingsIntoConfig, config.stt.provider === 'openai' could
+ * be either the DEFAULT_CONFIG value or an explicit dashboard choice — only
+ * the presence of a `provider` in the stored `cfg.stt` row distinguishes the
+ * two. `loadStored` is injectable for tests; the default reads the vault DB
+ * (open in every runtime caller: boot, reload appliers, API routes).
+ */
+export function effectiveSttForBinding(
+  config: JarvisConfig,
+  loadStored: (section: 'stt' | 'tts') => unknown = loadUserSection,
+): STTConfig | undefined {
+  if (!hasUsejarvisAi(config)) return config.stt;
+  if (storedProviderChoice(loadStored('stt'))) return config.stt;
+  return { ...config.stt, provider: 'usejarvis' };
 }
