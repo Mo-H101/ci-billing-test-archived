@@ -505,6 +505,115 @@ export class ElevenLabsTTSProvider implements TTSProvider {
 }
 
 /**
+ * Hosted "Usejarvis AI" TTS — the platform proxy's OpenAI-compatible
+ * /audio/speech endpoint. `uj-tts` is the stable per-plan alias (resolution
+ * happens at the proxy, like uj-stt and the LLM tiers). Credentials come from
+ * the system-owned `usejarvis_ai` block via the factory's `hosted` argument —
+ * never from cfg.tts.
+ */
+/** Per-request ceiling for hosted speech. Generous for a spoken sentence,
+ * bounded for a reply that never split. */
+const MAX_TTS_INPUT_CHARS = 4_000;
+/** Hard cap on one synthesis round-trip — see the call site. */
+const TTS_TIMEOUT_MS = 30_000;
+
+/** MP3 frame sniff: an ID3 tag, or an MPEG audio sync word (0xFF Ex). Used to
+ * accept a correct response whose content-type header a proxy stripped or
+ * rewrote, so the guard rejects interstitials without rejecting real audio. */
+function looksLikeMp3(buf: Buffer): boolean {
+  if (buf.length < 3) return false;
+  if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return true; // "ID3"
+  return buf[0] === 0xff && (buf[1]! & 0xe0) === 0xe0;
+}
+
+export class UsejarvisTTS implements TTSProvider {
+  private baseUrl: string;
+  private apiKey: string;
+  private voice: string;
+
+  constructor(baseUrl: string, apiKey: string, voice: string = 'alloy') {
+    // Same origin→/v1 normalization as UsejarvisSTT / UsejarvisAIProvider.
+    const trimmed = baseUrl.replace(/\/+$/, '');
+    this.baseUrl = /\/v1$/.test(trimmed) ? trimmed : `${trimmed}/v1`;
+    this.apiKey = apiKey;
+    this.voice = voice;
+  }
+
+  async synthesize(text: string): Promise<Buffer> {
+    // Cap the input. splitIntoSentences returns the WHOLE text as one
+    // "sentence" when it cannot find a boundary (a long bullet list, a URL
+    // dump), and this endpoint is billed per CHARACTER — so an unsplittable
+    // reply would bill in one unbounded request. Truncating costs a clipped
+    // tail; not truncating costs real money on a runaway generation.
+    let input = text;
+    if (text.length > MAX_TTS_INPUT_CHARS) {
+      let cut = MAX_TTS_INPUT_CHARS;
+      // Never split a surrogate pair — a lone surrogate is invalid JSON string
+      // content for the proxy.
+      const last = text.charCodeAt(cut - 1);
+      if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+      input = text.slice(0, cut);
+      console.warn(`[UsejarvisTTS] Input truncated from ${text.length} to ${input.length} chars (per-request cap; the spoken reply will cut off)`);
+    }
+
+    const response = await fetch(`${this.baseUrl}/audio/speech`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'uj-tts',
+        input,
+        voice: this.voice,
+        response_format: 'mp3',
+      }),
+      // A hung proxy must not wedge the sentence queue: ws-service speaks
+      // sentences in sequence, so one stalled request silences everything
+      // after it with no error and no timeout of its own.
+      signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      // Shared mapper, same reasoning as the STT branch: /api/tts/preview
+      // returns err.message straight to the settings toast, so budget and
+      // plan failures must read as copy, not as proxy JSON.
+      throw hostedProxyError('Usejarvis AI TTS', response.status, err);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const audio = Buffer.from(arrayBuffer);
+
+    // A 200 that isn't audio is the SAME class as UsejarvisSTT's
+    // no-transcript branch: a proxy or CDN interstitial is exactly where an
+    // echoed bearer shows up. Without this check the HTML would be returned
+    // AS the MP3 — nothing throws, so redaction never runs, and the preview
+    // route ships it to the browser labelled audio/mpeg with the key inside.
+    // Empty stays a no-op (callers already treat it as "nothing to speak");
+    // an interstitial always carries bytes, so the guard loses nothing.
+    const contentType = response.headers.get('content-type') ?? '';
+    if (audio.length > 0 && !contentType.toLowerCase().startsWith('audio/') && !looksLikeMp3(audio)) {
+      const body = audio.subarray(0, 2048).toString('utf8');
+      throw new Error(
+        `Usejarvis AI TTS returned a non-audio body (content-type: ${contentType || 'none'}): ` +
+          `${redactSecrets(body).slice(0, 200)}`,
+      );
+    }
+    return audio;
+  }
+
+  async *synthesizeStream(text: string): AsyncIterable<Buffer> {
+    // Same fake-streaming shape as the other providers: one complete MP3 per
+    // sentence, so the browser's decodeAudioData always gets a valid file.
+    const audio = await this.synthesize(text);
+    if (audio.length > 0) {
+      yield audio;
+    }
+  }
+}
+
+/**
  * Sarvam AI TTS Provider — high-quality Indian language voices via Sarvam AI.
  */
 export class SarvamTTSProvider implements TTSProvider {
@@ -587,9 +696,24 @@ export async function listElevenLabsVoices(apiKey: string): Promise<{
 /**
  * Factory: create the right TTS provider from config.
  * Returns null if TTS is disabled.
+ *
+ * `hosted` is the same separate credential channel as createSTTProvider's:
+ * cfg.tts only ever stores the string choice `provider: 'usejarvis'`.
  */
-export function createTTSProvider(config: TTSConfig): TTSProvider | null {
+export function createTTSProvider(
+  config: TTSConfig,
+  hosted?: HostedVoiceCredentials | null,
+): TTSProvider | null {
   if (!config.enabled) return null;
+
+  if (config.provider === 'usejarvis') {
+    if (!hosted?.baseUrl || !hosted?.apiKey) return null;
+    // Reuse a configured voice only when it isn't an Edge neural name:
+    // cfg.tts.voice defaults to 'en-US-AriaNeural' (Edge-specific), which the
+    // OpenAI-compatible proxy would reject — those fall back to 'alloy'.
+    const voice = config.voice && !/Neural$/i.test(config.voice) ? config.voice : undefined;
+    return new UsejarvisTTS(hosted.baseUrl, hosted.apiKey, voice ?? 'alloy');
+  }
 
   if (config.provider === 'elevenlabs') {
     if (!config.elevenlabs?.api_key) return null;

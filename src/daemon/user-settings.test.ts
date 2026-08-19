@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initDatabase, closeDb } from '../vault/schema.ts';
 import { getSetting, setSetting } from '../vault/settings.ts';
+import { getSecret } from '../vault/keychain.ts';
 import { loadConfig } from '../config/loader.ts';
 import { DEFAULT_CONFIG, type JarvisConfig } from '../config/types.ts';
 import {
@@ -11,6 +12,7 @@ import {
   loadUserSection,
   importLegacyUserSettings,
   mergeUserSettingsIntoConfig,
+  persistUserPatch,
   saveGoogleSettings,
   setSectionSavedListener,
 } from './user-settings.ts';
@@ -244,6 +246,87 @@ describe('user-settings', () => {
     hosted.google = { client_id: 'company-client', client_secret: 'company-secret' };
     mergeUserSettingsIntoConfig(hosted);
     expect(hosted.google.client_id).toBe('company-client');
+  });
+
+  test('persistUserPatch: a provider-less patch NEVER stamps a provider into the row', () => {
+    // The silence signal effectiveSttForBinding/effectiveTtsForBinding read
+    // is the row's provider field — an enable-toggle or key-only save must
+    // not turn silence into a recorded 'edge'/'openai' choice.
+    persistUserPatch('tts', { enabled: true });
+    expect(loadUserSection('tts')).toEqual({ enabled: true });
+
+    persistUserPatch('stt', { openai: { api_key: 'sk-user' } });
+    // The row is written STRIPPED — the credential is split out to the
+    // encrypted keychain on the way in — so what matters here is that no
+    // `provider` appeared, not that the key round-trips.
+    expect(loadUserSection('stt')).toEqual({ openai: {} });
+  });
+
+  test('persistUserPatch: merges over the STORED row, not the in-memory merged section', () => {
+    saveUserSection('tts', { enabled: false, elevenlabs: { api_key: 'el-key' } });
+    // The point is the MERGE BASE: non-key fields of the stored row survive a
+    // partial patch, and the DEFAULT_CONFIG fills (provider/voice/rate) never
+    // appear. Credentials live in the keychain, so the row itself is stripped.
+    persistUserPatch('tts', { enabled: true, elevenlabs: { voice_id: 'v-2' } });
+    expect(loadUserSection('tts')).toEqual({
+      enabled: true,
+      elevenlabs: { voice_id: 'v-2' },
+    });
+  });
+
+  test('persistUserPatch: an explicit provider in the patch is recorded as intent', () => {
+    persistUserPatch('tts', { enabled: true, provider: 'edge', voice: 'en-GB-SoniaNeural' });
+    expect(loadUserSection('tts')).toEqual({ enabled: true, provider: 'edge', voice: 'en-GB-SoniaNeural' });
+
+    persistUserPatch('stt', { provider: 'usejarvis' });
+    expect(loadUserSection('stt')).toEqual({ provider: 'usejarvis' });
+  });
+
+  test('persistUserPatch: notifies the section-saved listener (hot-reload choke point)', () => {
+    const events: string[] = [];
+    setSectionSavedListener((section) => events.push(section));
+    persistUserPatch('stt', { provider: 'groq' });
+    persistUserPatch('tts', { enabled: true });
+    expect(events).toEqual(['stt', 'tts']);
+  });
+
+  // ── keychain survival: the stored row is STRIPPED, so the merge base must be
+  // hydrated with the stored credentials before the save re-runs the secret
+  // split — otherwise every patch deletes the keys it does not carry. ──────────
+
+  test('persistUserPatch: keychain key survives an {enabled}-only patch', () => {
+    saveUserSection('tts', { enabled: true, provider: 'elevenlabs', elevenlabs: { api_key: 'el-secret', voice_id: 'v1' } });
+    expect(getSecret('tts.elevenlabs.api_key')).toBe('el-secret');
+
+    persistUserPatch('tts', { enabled: false });
+
+    expect(getSecret('tts.elevenlabs.api_key')).toBe('el-secret');
+    expect(loadUserSection('tts')).toEqual({
+      enabled: false, provider: 'elevenlabs', elevenlabs: { voice_id: 'v1' },
+    });
+  });
+
+  test('persistUserPatch: switching STT provider keeps BOTH stored keys', () => {
+    saveUserSection('stt', {
+      provider: 'openai',
+      openai: { api_key: 'sk-openai-secret' },
+      groq: { api_key: 'gsk-groq-secret' },
+    });
+
+    persistUserPatch('stt', { provider: 'groq' });
+
+    expect(getSecret('stt.openai.api_key')).toBe('sk-openai-secret');
+    expect(getSecret('stt.groq.api_key')).toBe('gsk-groq-secret');
+    expect(loadUserSection('stt')).toEqual({ provider: 'groq', openai: {}, groq: {} });
+  });
+
+  test('persistUserPatch: a patch touching one sub-block does not delete a sibling key', () => {
+    saveUserSection('stt', { provider: 'openai', openai: { api_key: 'sk-openai-secret' } });
+
+    persistUserPatch('stt', { groq: { api_key: 'gsk-new' } });
+
+    expect(getSecret('stt.openai.api_key')).toBe('sk-openai-secret');
+    expect(getSecret('stt.groq.api_key')).toBe('gsk-new');
   });
 
   test('end to end: legacy file -> import -> discard -> merge equals old behavior', async () => {

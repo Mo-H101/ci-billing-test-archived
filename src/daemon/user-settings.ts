@@ -27,6 +27,7 @@
 import { createHash } from 'node:crypto';
 import { getSetting, setSetting } from '../vault/settings.ts';
 import { deepMerge } from '../config/loader.ts';
+import { mergeSTTConfig, mergeTTSConfig } from './config-merge.ts';
 import {
   SECRET_SECTIONS,
   SecretStorageError,
@@ -41,6 +42,8 @@ import {
   USER_OWNED_SECTIONS,
   WORKFLOW_SYSTEM_KEYS,
   type JarvisConfig,
+  type STTConfig,
+  type TTSConfig,
   type UserOwnedSection,
 } from '../config/types.ts';
 
@@ -103,6 +106,43 @@ export function saveUserSection<K extends UserOwnedSection>(
   }
   setSetting(settingKey(section), JSON.stringify(stored ?? null));
   notifySectionSaved(section);
+}
+
+/**
+ * Persist a partial STT/TTS patch by merging it over the STORED row — never
+ * over the in-memory merged section. The in-memory value carries
+ * DEFAULT_CONFIG fills (stt provider 'openai'; tts provider 'edge', voice,
+ * rate, ...), and persisting those would stamp a provider choice the user
+ * never made into the DB row — the exact signal effectiveSttForBinding /
+ * effectiveTtsForBinding read to decide whether the user is "silent" (hosted
+ * installs default silent users to the included Usejarvis AI voice stack).
+ *
+ * EVERY save path for these two sections must go through here (dashboard
+ * routes, onboarding setup, voice commands): one path calling
+ * saveUserSection with the merged in-memory section re-introduces the stamp.
+ * Callers update the in-memory config separately for runtime use.
+ *
+ * The stored row is STRIPPED (credentials live in the encrypted keychain), so
+ * the merge base is hydrated via injectSectionSecrets first — saveUserSection
+ * re-runs the secret split on the way out, and persistSectionSecrets treats an
+ * absent credential as "delete it". Merging over the bare stripped row would
+ * therefore destroy every stored key the patch does not carry (it did, once).
+ */
+export function persistUserPatch(section: 'stt' | 'tts', patch: Record<string, unknown>): void {
+  const stored = loadUserSection(section);
+  // Cast, don't default: the merge helpers substitute a provider-carrying
+  // default for an UNDEFINED base, which would stamp silence into the row.
+  // A `{}` base merges cleanly and stays provider-free unless the patch
+  // itself carries a choice. Secrets are injected only when a row exists —
+  // same orphan rule as mergeUserSettingsIntoConfig.
+  const base = (typeof stored === 'object' && stored !== null && !Array.isArray(stored))
+    ? injectSectionSecrets(section, stored)
+    : {};
+  if (section === 'stt') {
+    saveUserSection('stt', mergeSTTConfig(base as STTConfig, patch));
+  } else {
+    saveUserSection('tts', mergeTTSConfig(base as TTSConfig, patch));
+  }
 }
 
 /** Read one stored section; undefined when absent or unparseable. */

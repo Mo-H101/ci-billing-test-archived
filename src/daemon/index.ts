@@ -894,9 +894,13 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       if (jarvisConfig.tts?.enabled) {
         try {
           const { createTTSProvider } = await import('../comms/voice.ts');
-          pebbleTTS = createTTSProvider(jarvisConfig.tts);
+          const { effectiveTtsForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+          const ttsBinding = effectiveTtsForBinding(jarvisConfig);
+          pebbleTTS = ttsBinding
+            ? createTTSProvider(ttsBinding, usejarvisVoiceCredentials(jarvisConfig))
+            : null;
           if (pebbleTTS) {
-            console.log(`[ambient-ui] TTS provider for pebble: ${jarvisConfig.tts.provider ?? 'edge-tts'}`);
+            console.log(`[ambient-ui] TTS provider for pebble: ${ttsBinding?.provider ?? 'edge-tts'}`);
           }
         } catch (err) {
           console.warn('[ambient-ui] failed to init TTS provider:', err);
@@ -918,7 +922,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         pebbleTTS = null;
         if (cfg.tts?.enabled) {
           const { createTTSProvider } = await import('../comms/voice.ts');
-          pebbleTTS = createTTSProvider(cfg.tts);
+          const { effectiveTtsForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+          const ttsBinding = effectiveTtsForBinding(cfg);
+          pebbleTTS = ttsBinding ? createTTSProvider(ttsBinding, usejarvisVoiceCredentials(cfg)) : null;
         }
         console.log(`[ambient-ui] TTS provider ${pebbleTTS ? 'rebuilt' : 'cleared'} (settings reload)`);
       });
@@ -933,6 +939,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             return 'audio/wav';
           case 'elevenlabs':
           case 'edge':
+          case 'usejarvis': // proxy /audio/speech is asked for response_format: 'mp3'
           default:
             return 'audio/mp3';
         }
@@ -1529,21 +1536,23 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // hook then runs the stt/tts appliers (pebble + dashboard providers),
       // so the next response uses the new setting without a daemon restart.
       // Both appliers persist BEFORE mutating jarvisConfig and report failure
-      // instead of throwing: saveUserSection throws when the keychain refuses a
-      // credential, and an exception here would abort the whole response cycle
-      // — the user would get silence instead of an answer.
+      // instead of throwing: persistUserPatch throws when the keychain refuses
+      // a credential, and an exception here would abort the whole response
+      // cycle — the user would get silence instead of an answer.
       const applyTTSEnabled = async (enabled: boolean): Promise<boolean> => {
-        const { saveUserSection } = await import('./user-settings.ts');
-        const next = jarvisConfig.tts
-          ? { ...jarvisConfig.tts, enabled }
-          : { enabled, provider: 'edge' as const };
+        const { persistUserPatch } = await import('./user-settings.ts');
+        // Patch-over-STORED-row (see persistUserPatch): persisting the merged
+        // in-memory section here would record the DEFAULT provider 'edge' as
+        // a choice the user never made, pinning hosted installs to Edge
+        // instead of the included Usejarvis AI voice.
         try {
-          saveUserSection('tts', next);
+          persistUserPatch('tts', { enabled });
         } catch (err) {
           console.error('[ambient-ui] Could not save the TTS setting:', err);
           return false;
         }
-        jarvisConfig.tts = next;
+        if (!jarvisConfig.tts) jarvisConfig.tts = { enabled };
+        else jarvisConfig.tts.enabled = enabled;
         // Await the applier (vs the save hook's scheduled run) so pebbleTTS
         // is already rebuilt when the confirmation reply is spoken — "turn
         // on text to speech" must be audible in the SAME response cycle.
@@ -1552,25 +1561,31 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         return true;
       };
 
-      const applySTTProvider = async (provider: 'openai' | 'groq' | 'sarvam' | 'local'): Promise<boolean> => {
-        const { saveUserSection } = await import('./user-settings.ts');
+      const applySTTProvider = async (provider: 'openai' | 'groq' | 'sarvam' | 'local' | 'usejarvis'): Promise<boolean> => {
+        const { persistUserPatch } = await import('./user-settings.ts');
+        const { hasUsejarvisAi } = await import('./usejarvis-ai.ts');
         if (!jarvisConfig.stt) jarvisConfig.stt = { provider };
-        // Refuse the switch if the target provider has no API key
-        // configured — we don't want to silently break STT.
+        // Refuse the switch if the target provider has no credentials
+        // configured — we don't want to silently break STT. The hosted
+        // 'usejarvis' choice is gated on the system usejarvis_ai block
+        // (its key never lives in cfg.stt).
         const hasKey = (() => {
+          if (provider === 'usejarvis') return hasUsejarvisAi(jarvisConfig);
           if (provider === 'local') return !!jarvisConfig.stt!.local?.endpoint;
           const sub = (jarvisConfig.stt as unknown as Record<string, { api_key?: string } | undefined>)[provider];
           return !!sub?.api_key;
         })();
         if (!hasKey) return false;
-        const next = { ...jarvisConfig.stt, provider };
+        // Patch-over-STORED-row: the provider IS explicit intent here, but
+        // the rest of the merged in-memory section must not ride along.
         try {
-          saveUserSection('stt', next);
+          persistUserPatch('stt', { provider });
         } catch (err) {
           console.error('[ambient-ui] Could not save the STT provider:', err);
           return false;
         }
-        jarvisConfig.stt = next;
+        if (!jarvisConfig.stt) jarvisConfig.stt = { provider };
+        else jarvisConfig.stt.provider = provider;
         // Deterministic swap: the next transcription must already use the
         // new provider when we confirm the switch to the user.
         await settingsReload?.applyNow('stt');
@@ -1774,14 +1789,19 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
         // STT provider switch.
         const sttMatch =
-          /\b(switch|change)\s+(?:the\s+)?(stt|speech[- ]to[- ]text|transcription|speech recognition|listening)\s+(?:to|provider to)\s+(openai|whisper|groq|sarvam|local)\b/.exec(t) ||
-          /\buse\s+(openai|whisper|groq|sarvam|local)\s+(?:for\s+(?:stt|speech[- ]to[- ]text|transcription|speech recognition|listening|hearing))\b/.exec(t);
+          /\b(switch|change)\s+(?:the\s+)?(stt|speech[- ]to[- ]text|transcription|speech recognition|listening)\s+(?:to|provider to)\s+(openai|whisper|groq|sarvam|local|usejarvis|use jarvis|jarvis)\b/.exec(t) ||
+          /\buse\s+(openai|whisper|groq|sarvam|local|usejarvis|use jarvis|jarvis)\s+(?:for\s+(?:stt|speech[- ]to[- ]text|transcription|speech recognition|listening|hearing))\b/.exec(t);
         if (sttMatch) {
-          let target = (sttMatch[2] === 'whisper' ? 'openai' : sttMatch[2]) as 'openai' | 'groq' | 'sarvam' | 'local';
+          // 'whisper' → openai; 'jarvis' / 'use jarvis' (how STT typically
+          // transcribes the brand name) → the hosted usejarvis provider.
+          type SttTarget = 'openai' | 'groq' | 'sarvam' | 'local' | 'usejarvis';
+          const canonical = (name: string): SttTarget =>
+            (name === 'whisper' ? 'openai' : name === 'use jarvis' || name === 'jarvis' ? 'usejarvis' : name) as SttTarget;
+          let target = canonical(sttMatch[2]!);
           // The first capture group depends on which alternative matched.
           const candidate = (sttMatch[3] || sttMatch[1]) as string;
-          if (candidate && /^(openai|whisper|groq|sarvam|local)$/.test(candidate)) {
-            target = (candidate === 'whisper' ? 'openai' : candidate) as typeof target;
+          if (candidate && /^(openai|whisper|groq|sarvam|local|usejarvis|use jarvis|jarvis)$/.test(candidate)) {
+            target = canonical(candidate);
           }
           const ok = await applySTTProvider(target);
           await speakConfirmation(
@@ -3587,10 +3607,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // 8c. Wire TTS provider if configured
     if (jarvisConfig.tts?.enabled) {
       const { createTTSProvider } = await import('../comms/voice.ts');
-      const ttsProvider = createTTSProvider(jarvisConfig.tts);
+      const { effectiveTtsForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+      const ttsBinding = effectiveTtsForBinding(jarvisConfig);
+      const ttsProvider = ttsBinding
+        ? createTTSProvider(ttsBinding, usejarvisVoiceCredentials(jarvisConfig))
+        : null;
       if (ttsProvider) {
         wsService.setTTSProvider(ttsProvider);
-        console.log(`[Daemon] TTS enabled: ${jarvisConfig.tts.voice ?? 'en-US-AriaNeural'}`);
+        console.log(`[Daemon] TTS enabled: ${ttsBinding?.provider ?? 'edge'} (${jarvisConfig.tts.voice ?? 'en-US-AriaNeural'})`);
       }
     }
 
@@ -3692,7 +3716,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // provider on disable.
     settingsReload.registerApplier('tts', async (cfg) => {
       const { createTTSProvider } = await import('../comms/voice.ts');
-      wsService.setTTSProvider(cfg.tts?.enabled ? createTTSProvider(cfg.tts) : null);
+      const { effectiveTtsForBinding, usejarvisVoiceCredentials } = await import('./usejarvis-ai.ts');
+      const ttsBinding = cfg.tts?.enabled ? effectiveTtsForBinding(cfg) : undefined;
+      wsService.setTTSProvider(ttsBinding ? createTTSProvider(ttsBinding, usejarvisVoiceCredentials(cfg)) : null);
     });
 
     // google — refresh the auth (disconnect unlinks the tokens file; the
