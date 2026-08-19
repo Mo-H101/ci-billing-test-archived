@@ -384,6 +384,13 @@ export type LLMProviderEntry = {
   base_url?: string;
   /** Header used to send api_key. Authorization values are prefixed with Bearer. */
   auth_header?: string;
+  /**
+   * usejarvis_ai entries only: the system-block prompt-cache opt-in,
+   * carried through by applyUsejarvisAi so the binding layer can see it.
+   * Unlike the user-level `llm.prompt_cache` toggle (default ON), this
+   * defaults OFF — see the `usejarvis_ai.prompt_cache` block comment.
+   */
+  prompt_cache?: boolean;
 };
 
 /**
@@ -445,7 +452,33 @@ export type JarvisConfig = {
    * USER_OWNED_SECTIONS) and is re-applied over every DB merge by
    * applyUsejarvisAi (daemon/usejarvis-ai.ts). Absent on self-hosted installs.
    */
-  usejarvis_ai?: { base_url?: string; api_key?: string };
+  usejarvis_ai?: {
+    base_url?: string;
+    api_key?: string;
+    /**
+     * OPT-IN for Anthropic prompt-cache breakpoints on hosted LLM calls
+     * (margin-critical when on: cached reads bill at ~0.1x fresh input).
+     * Absent/false means OFF.
+     *
+     * MUST REMAIN false FLEET-WIDE until the platform ships per-tenant
+     * upstream credentials. Platform-verified 2026-08-19: the prompt cache
+     * namespace follows the single upstream api_key shared by every tenant
+     * — a cross-tenant cache_read on a never-sent prefix was measured. A
+     * shared namespace is a byte-level confirmation oracle on other
+     * tenants' prompt prefixes (plus a 1.25x-write/0.1x-read billing
+     * asymmetry), and no client-side mitigation exists. The fix is
+     * platform-side; do not write `true` before it lands.
+     *
+     * Also verified 2026-08-19: cache_control forwarding is per-provider
+     * (openai/ upstreams receive the marker VERBATIM — 400 risk — while
+     * gemini/ drops it and anthropic/ translates and keeps it), so this
+     * gate stays required even after the namespace fix unless emission
+     * becomes vendor-aware; markers on tool-role messages ARE translated
+     * and honoured (cached at tool_result.content depth), so the
+     * last-user-message breakpoint anchor is safe.
+     */
+    prompt_cache?: boolean;
+  };
   user?: UserConfig;
   onboarding?: OnboardingConfig;
   telemetry?: TelemetryConfig;

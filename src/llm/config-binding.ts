@@ -102,7 +102,14 @@ export function instantiateProvider(
       // Hosted platform proxy: both values come from the system-owned
       // config.yaml block (daemon/usejarvis-ai.ts) - nothing to guess.
       if (!entry.base_url?.trim() || !entry.api_key?.trim()) return null;
-      provider = new UsejarvisAIProvider(entry.base_url.trim(), entry.api_key.trim());
+      provider = new UsejarvisAIProvider(entry.base_url.trim(), entry.api_key.trim(), {
+        // Anthropic prompt caching. OPT-IN via the system block (the uj-*
+        // aliases are vendor-opaque, so only the provisioner can assert the
+        // proxy strips markers for non-Anthropic upstreams — see
+        // usejarvis_ai.prompt_cache in config/types.ts), AND still subject
+        // to the user-level switch the anthropic/openrouter cases honour.
+        promptCache: entry.prompt_cache === true && globals?.promptCache !== false,
+      });
       break;
     default:
       console.warn(`[LLM] Unknown provider kind '${kind}' for '${name}' - skipping.`);

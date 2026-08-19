@@ -205,6 +205,101 @@ describe('UsejarvisAIProvider', () => {
     expect(text.length).toBeLessThan(300); // never the unbounded CDN page
   });
 
+  // Streaming is the primary hosted conversational path; without real usage
+  // there, cache_creation_input_tokens is hardcoded 0 and a silent cache
+  // decline is indistinguishable from success — the exact blindness the
+  // field exists to remove. Usage placement differs by backend: real OpenAI
+  // sends it on a terminal EMPTY-choices chunk, while the hosted LiteLLM
+  // proxy rides it on the LAST CONTENT chunk (choices=1, no empty-choices
+  // terminal at all — platform-verified 2026-08-19). The parser must take
+  // usage from whichever chunk carries it; both shapes below pin the same
+  // reported usage.
+  const STREAM_USAGE = {
+    prompt_tokens: 1000, completion_tokens: 5, total_tokens: 1005,
+    prompt_tokens_details: { cached_tokens: 800 },
+    cache_creation_input_tokens: 150,
+  };
+  const EXPECTED_STREAM_USAGE = {
+    input_tokens: 50, // 1000 - 800 cached - 150 written
+    output_tokens: 5,
+    cache_read_input_tokens: 800,
+    cache_creation_input_tokens: 150,
+  };
+
+  async function streamUsageFromSse(sse: string): Promise<{ sent: any; done: any }> {
+    let sent: any = null;
+    globalThis.fetch = (async (_url: any, init?: any) => {
+      sent = JSON.parse(String(init.body));
+      return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }) as unknown as typeof fetch;
+    const provider = new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc');
+    const events: any[] = [];
+    for await (const event of provider.stream([{ role: 'user', content: 'hi' }], { model: 'uj-chat' })) {
+      events.push(event);
+    }
+    return { sent, done: events.find((e) => e.type === 'done') };
+  }
+
+  it('requests include_usage and reports usage from an empty-choices terminal chunk (OpenAI shape)', async () => {
+    const sse = [
+      'data: ' + JSON.stringify({
+        id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'uj-chat',
+        choices: [{ index: 0, delta: { role: 'assistant', content: 'hey' }, finish_reason: null }],
+      }),
+      'data: ' + JSON.stringify({
+        id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'uj-chat',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      }),
+      // The include_usage terminal chunk: EMPTY choices, usage attached.
+      'data: ' + JSON.stringify({
+        id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'uj-chat',
+        choices: [],
+        usage: STREAM_USAGE,
+      }),
+      'data: [DONE]', '',
+    ].join('\n');
+    const { sent, done } = await streamUsageFromSse(sse);
+    expect(sent.stream_options).toEqual({ include_usage: true });
+    expect(done.response.usage).toEqual(EXPECTED_STREAM_USAGE);
+  });
+
+  it('reports usage riding on the last CONTENT chunk with no empty-choices terminal (proxy shape)', async () => {
+    const sse = [
+      'data: ' + JSON.stringify({
+        id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'uj-chat',
+        choices: [{ index: 0, delta: { role: 'assistant', content: 'hey' }, finish_reason: null }],
+      }),
+      // Measured proxy shape: usage on the final content chunk, choices=1,
+      // then straight to [DONE] — no empty-choices chunk exists.
+      'data: ' + JSON.stringify({
+        id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'uj-chat',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        usage: STREAM_USAGE,
+      }),
+      'data: [DONE]', '',
+    ].join('\n');
+    const { done } = await streamUsageFromSse(sse);
+    expect(done.response.usage).toEqual(EXPECTED_STREAM_USAGE);
+    expect(done.response.content).toBe('hey');
+  });
+
+  // The uncached-input subtraction assumes the proxy folds cache writes into
+  // prompt_tokens; an unfolded report must clamp at zero, not persist a
+  // negative count into llm_usage.
+  it('clamps input_tokens at zero when the proxy reports unfolded cache writes', async () => {
+    globalThis.fetch = (async () => jsonResponse(200, {
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 900, completion_tokens: 3, total_tokens: 903,
+        prompt_tokens_details: { cached_tokens: 900 },
+        cache_creation_input_tokens: 200,
+      },
+    })) as unknown as typeof fetch;
+    const provider = new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc');
+    const res = await provider.chat([{ role: 'user', content: 'hi' }], { model: 'uj-chat' });
+    expect(res.usage.input_tokens).toBe(0);
+  });
+
   it('filters the catalog to uj-* so a mis-scoped key cannot leak upstream ids', async () => {
     globalThis.fetch = (async () => jsonResponse(200, {
       data: [{ id: 'uj-chat' }, { id: 'claude-haiku-4-5-20251001' }, { id: 'gpt-4o-mini' }],
@@ -226,5 +321,208 @@ describe('UsejarvisAIProvider', () => {
   it('defaultModel is uj-medium so the manager model-less retry never posts an empty model (pr2 review #7)', () => {
     const provider = new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc');
     expect((provider as unknown as { defaultModel: string }).defaultModel).toBe('uj-medium');
+  });
+});
+
+/**
+ * Prompt-cache breakpoints. MARGIN-CRITICAL: agentic turns re-send a growing
+ * prefix, and the proxy bills a cached read at ~0.1x fresh input (measured
+ * live). LiteLLM only forwards the marker when it rides ON a content part —
+ * a top-level cache_control field, which OpenRouter accepts, is dropped.
+ */
+const sentVolatileMarked = (sent: any): boolean =>
+  sent.messages.some((m: any) =>
+    Array.isArray(m.content) &&
+    m.content.some((p: any) => p.cache_control && String(p.text).includes('In flight')));
+
+describe('UsejarvisAIProvider prompt-cache markers', () => {
+  const capture = async (
+    messages: Array<Record<string, unknown>>,
+    // The marker tests exercise an OPTED-IN provider; the opt-in default
+    // itself (OFF) is pinned by its own test below.
+    opts: { promptCache?: boolean } = { promptCache: true },
+  ): Promise<any> => {
+    let sent: any = null;
+    globalThis.fetch = (async (_url: any, init?: any) => {
+      sent = JSON.parse(String(init.body));
+      return jsonResponse(200, {
+        choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      });
+    }) as unknown as typeof fetch;
+    const provider = new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc', opts);
+    await provider.chat(messages as any, { model: 'uj-chat' });
+    return sent;
+  };
+
+  // The uj-* aliases are vendor-opaque: a marker reaching a non-Anthropic
+  // upstream is an unknown property → 400 on every call. Emission must be
+  // an explicit provisioner opt-in, never a default.
+  it('sends no cache_control unless the system block opts in', async () => {
+    const sent = await capture([
+      { role: 'system', content: 'You are Jarvis. ' + 'x'.repeat(200), cache: true },
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'second' },
+    ], {});
+    expect(JSON.stringify(sent)).not.toContain('cache_control');
+  });
+
+  it('config binding enables markers only with the block opt-in AND the user switch', () => {
+    const entry = {
+      kind: 'usejarvis_ai' as const,
+      base_url: 'https://llm.usejarvis.host',
+      api_key: 'sk-uj-abc',
+    };
+    const flag = (p: unknown): boolean => (p as any).promptCache;
+    expect(flag(instantiateProvider('usejarvis_ai', entry))).toBe(false);
+    expect(flag(instantiateProvider('usejarvis_ai', { ...entry, prompt_cache: true }))).toBe(true);
+    expect(flag(instantiateProvider('usejarvis_ai', { ...entry, prompt_cache: true }, { promptCache: false }))).toBe(false);
+  });
+
+  it('marks the cache:true system block and the newest user turn', async () => {
+    const sent = await capture([
+      { role: 'system', content: 'You are Jarvis. ' + 'x'.repeat(200), cache: true },
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'second' },
+    ]);
+    expect(sent.messages[0].content).toEqual([
+      { type: 'text', text: expect.stringContaining('You are Jarvis.'), cache_control: { type: 'ephemeral' } },
+    ]);
+    // Rolling breakpoint on the newest turn — what the NEXT request reads.
+    expect(sent.messages[3].content[0].cache_control).toEqual({ type: 'ephemeral' });
+    // Untouched in between, so the prefix stays byte-identical across turns.
+    expect(sent.messages[1].content).toBe('first');
+    expect(sent.messages[2].content).toBe('reply');
+  });
+
+  // THE test for this feature. Callers emit [static(cache:true), dynamic],
+  // and the dynamic block carries elapsed-second counters. Marking the last
+  // SYSTEM message (rather than the last MARKED one) ends the cached prefix
+  // on bytes that change every turn, so the entry can never be read back —
+  // the write premium is paid and the persona is re-billed at full rate.
+  // Asserting the marked text is byte-identical across two turns is what
+  // catches that; it fails against a positional heuristic.
+  it('ends the cached prefix on stable bytes when a dynamic system block follows', async () => {
+    const persona = 'You are Jarvis. ' + 'x'.repeat(2000);
+    const turn = (elapsed: number) => [
+      { role: 'system', content: persona, cache: true },
+      { role: 'system', content: `In flight: task-1 (running, ${elapsed}s)` },
+      { role: 'user', content: 'hi' },
+    ];
+    const a = await capture(turn(12));
+    const b = await capture(turn(47));
+
+    const markedOf = (sent: any) =>
+      sent.messages
+        .filter((m: any) => Array.isArray(m.content))
+        .flatMap((m: any) => m.content)
+        .filter((p: any) => p.cache_control)
+        .map((p: any) => p.text);
+
+    expect(markedOf(a)).toEqual([persona]);
+    // Byte-identical across turns → the prefix is reusable.
+    expect(markedOf(a)).toEqual(markedOf(b));
+    // …and the volatile block is NOT the boundary.
+    expect(sentVolatileMarked(a)).toBe(false);
+    expect(sentVolatileMarked(b)).toBe(false);
+  });
+
+  // One-shot calls never resend their prefix, so a rolling breakpoint there
+  // is a guaranteed-unread 1.25x cache write. AnthropicProvider guards on the
+  // presence of an assistant turn; this must match.
+  it('skips the rolling breakpoint on one-shot calls (no assistant turn)', async () => {
+    const sent = await capture([
+      { role: 'user', content: 'classify this: ' + 'y'.repeat(2000) },
+    ]);
+    expect(JSON.stringify(sent)).not.toContain('cache_control');
+  });
+
+  it('still marks a one-shot call\'s stable system prefix', async () => {
+    const sent = await capture([
+      { role: 'system', content: 'Extraction rules. ' + 'z'.repeat(2000), cache: true },
+      { role: 'user', content: 'extract' },
+    ]);
+    expect(sent.messages[0].content[0].cache_control).toEqual({ type: 'ephemeral' });
+    // …but not the user turn: nothing will resend this prefix.
+    expect(sent.messages[1].content).toBe('extract');
+  });
+
+  it('never sends a TOP-LEVEL cache_control (LiteLLM drops it)', async () => {
+    const sent = await capture([{ role: 'user', content: 'hi' }]);
+    expect(sent.cache_control).toBeUndefined();
+  });
+
+  it('honours the global prompt-cache switch', async () => {
+    const sent = await capture([{ role: 'user', content: 'hi' }], { promptCache: false });
+    expect(sent.messages[0].content).toBe('hi');
+    expect(JSON.stringify(sent)).not.toContain('cache_control');
+  });
+
+  // An assistant turn carrying tool_calls must keep content '' — promoting it
+  // to a part array changes what the API expects and breaks the tool loop.
+  it('leaves a tool_calls assistant message alone', async () => {
+    const sent = await capture([
+      { role: 'user', content: 'do it' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 't1', name: 'search', arguments: { q: 'x' } }],
+      },
+    ]);
+    expect(sent.messages[1].content).toBe('');
+    expect(sent.messages[1].tool_calls).toHaveLength(1);
+    expect(JSON.stringify(sent.messages[1])).not.toContain('cache_control');
+  });
+
+  // THE agentic-loop shape: from iteration 2 onward the last message is a
+  // `tool` result. LiteLLM's tool→tool_result translation is not verified to
+  // carry a content-part marker through, so the rolling breakpoint must
+  // anchor on the last USER message — marking the tool message is either a
+  // silent no-op on exactly the loop this feature exists for, or a 400.
+  it('anchors the rolling breakpoint on the last user turn, never a tool result', async () => {
+    const sent = await capture([
+      { role: 'system', content: 'You are Jarvis. ' + 'x'.repeat(200), cache: true },
+      { role: 'user', content: 'do the thing' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 't1', name: 'search', arguments: { q: 'x' } }],
+      },
+      { role: 'tool', content: 'result: ' + 'r'.repeat(500), tool_call_id: 't1' },
+    ]);
+    // The tool result stays a plain string — untouched.
+    expect(sent.messages[3].content).toBe('result: ' + 'r'.repeat(500));
+    expect(JSON.stringify(sent.messages[3])).not.toContain('cache_control');
+    // The user turn carries the rolling breakpoint instead.
+    expect(sent.messages[1].content[0].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  // An empty marked system block must not suppress the breakpoint: the
+  // boundary falls back to the previous marked block, matching
+  // AnthropicProvider's empty-block filter.
+  it('skips an empty cache:true system block and marks the previous one', async () => {
+    const persona = 'You are Jarvis. ' + 'x'.repeat(500);
+    const sent = await capture([
+      { role: 'system', content: persona, cache: true },
+      { role: 'system', content: '', cache: true },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'again' },
+    ]);
+    expect(sent.messages[0].content).toEqual([
+      { type: 'text', text: persona, cache_control: { type: 'ephemeral' } },
+    ]);
+  });
+
+  it('falls back to the last system block when the caller declares no boundary', async () => {
+    const sent = await capture([
+      { role: 'system', content: 'Rules. ' + 'q'.repeat(500) },
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'again' },
+    ]);
+    expect(sent.messages[0].content[0].cache_control).toEqual({ type: 'ephemeral' });
   });
 });
