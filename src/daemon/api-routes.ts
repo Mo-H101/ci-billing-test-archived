@@ -1618,6 +1618,41 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // Live Usejarvis AI catalog: the uj-* aliases THIS account's key may
+    // call (the proxy filters per key, so there is no hardcoded list). The
+    // provider is built from the system-owned config.yaml block — the route
+    // takes no credentials and never echoes the base_url or key back.
+    '/api/config/llm/usejarvis/models': {
+      GET: async () => {
+        const { hasUsejarvisAi } = await import('./usejarvis-ai.ts');
+        if (!hasUsejarvisAi(ctx.config)) {
+          return error('Usejarvis AI is only available on hosted installs.', 503);
+        }
+        try {
+          const { UsejarvisAIProvider } = await import('../llm/usejarvis.ts');
+          const { noteHostedCatalog } = await import('./usejarvis-ai.ts');
+          const block = ctx.config.usejarvis_ai!;
+          const provider = new UsejarvisAIProvider(block.base_url!.trim(), block.api_key!.trim());
+          const { models, degraded } = await provider.listModelsDetailed();
+          // A live catalog feeds the save-time allowlist; a degraded one never
+          // does (it would shrink the allowlist to the fallback four). The
+          // flag lets the dashboard show "plan catalog unreachable — Retry"
+          // instead of presenting the fallback as the plan's truth.
+          noteHostedCatalog(models, degraded);
+          return json({ ok: true, models, degraded });
+        } catch (err) {
+          // listModels embeds the upstream response body in its errors, and a
+          // CDN/proxy error page can echo the hosted base_url hostname this
+          // surface deliberately hides — the detail stays in the server log.
+          console.warn(
+            '[LLM] Usejarvis AI catalog fetch failed:',
+            err instanceof Error ? err.message : err,
+          );
+          return json({ ok: false, error: 'Usejarvis AI catalog unavailable', models: [] });
+        }
+      },
+    },
+
     // Full OmniRoute catalog: provider models, free routes, automatic routes,
     // and user-defined combos. POST keeps an onboarding API key out of the URL
     // and also supports a saved provider by name from Settings.
