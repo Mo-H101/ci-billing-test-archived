@@ -279,11 +279,33 @@ export interface RoleInfo {
 }
 
 export interface GoogleStatus {
-  status: "not_configured" | "credentials_saved" | "connected";
-  has_credentials: boolean;
+  status:
+    | "not_configured"
+    | "credentials_saved"
+    | "connected"
+    | "not_connected"
+    /** The grant is gone (revoked, or expired). Tokens may still be on disk. */
+    | "reconnect_required";
+  /**
+   * Google is usable on this instance. NOT "credentials are present": a managed
+   * instance has none by design — the control plane holds them — so the old name
+   * was false for exactly the mode it most had to describe.
+   */
+  configured: boolean;
   is_authenticated: boolean;
   scopes: string[];
   token_expiry: number | null;
+  /**
+   * Control-plane MANAGED (hosted). The credentials came from the system config
+   * and the account is connected through the control plane, so this daemon's own
+   * OAuth flow does not apply — its redirect URI is this instance's hostname,
+   * which is not registered with Google.
+   */
+  managed?: boolean;
+  /** Why a reconnect is needed, when `status` is "reconnect_required". */
+  reconnect_reason?: string;
+  /** Where the user connects, when managed. */
+  connect_url?: string;
 }
 
 export interface SidecarInfo {

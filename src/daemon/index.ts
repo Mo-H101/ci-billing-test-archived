@@ -30,6 +30,7 @@ import { CommitmentExecutor } from "./commitment-executor.ts";
 import { classifyEvent } from "./event-classifier.ts";
 import { createApiRoutes, setCorsOrigin } from "./api-routes.ts";
 import { GoogleAuth } from "../integrations/google-auth.ts";
+import { classifyGoogle, googleIdentity, makeGoogleAuth } from "../integrations/google-managed-refresh.ts";
 import { ResearchQueue } from "./research-queue.ts";
 import { researchQueueTool, setResearchQueueRef } from "../actions/tools/research.ts";
 import { spawnPersistentAgent, assignPersistentAgentTask } from "../actions/tools/agents.ts";
@@ -519,8 +520,18 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
     // 4b. Create GoogleAuth if configured
     let googleAuth: GoogleAuth | null = null;
-    if (jarvisConfig.google?.client_id && jarvisConfig.google?.client_secret) {
-      googleAuth = new GoogleAuth(jarvisConfig.google.client_id, jarvisConfig.google.client_secret);
+    // Managed instances have NO client credentials — the control plane holds
+    // them — so this cannot key on their presence or hosted Google would never
+    // start.
+    googleAuth = makeGoogleAuth(jarvisConfig);
+    // A config we REFUSED (a mis-rendered managed block) is logged HERE, once,
+    // rather than by the classifier: that runs on every status poll too, and
+    // logging inside it printed the same line twice per poll forever.
+    const googleShape = classifyGoogle(jarvisConfig);
+    if (googleShape.mode === 'none' && googleShape.reason) {
+      console.error(`[Daemon] Google is disabled: ${googleShape.reason}`);
+    }
+    if (googleAuth) {
       if (googleAuth.isAuthenticated()) {
         console.log('[Daemon] Google OAuth: authenticated (Gmail + Calendar observers enabled)');
       } else {
@@ -539,6 +550,13 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const observerService = config.noLocalTools
       ? null
       : new ObserverService(reactor, coalescer, googleAuth ?? undefined, config.dataDir);
+    // Hosted push bridge targets (GOOGLE.md). All absent on self-hosted, where
+    // the observers' own poll timers are the whole story.
+    observerService?.setPushTargets({
+      pubsubTopic: jarvisConfig.google?.pubsub_topic,
+      pushCallback: jarvisConfig.google?.push_callback,
+      channelToken: jarvisConfig.google?.channel_token,
+    });
     // Hosted mode: daemon.listen = unix:/run/jarvis/u_<id>.sock binds a unix
     // socket and no TCP port at all (Caddy is the only way in). `listen` was
     // resolved (and validated) once, before the lockfile write above.
@@ -3658,22 +3676,29 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // google — refresh the auth (disconnect unlinks the tokens file; the
     // null-first reload drops the stale in-memory tokens), hand it to the
     // observers and restart them so EmailSync/CalendarSync re-capture it.
-    let lastGoogleCreds = jarvisConfig.google?.client_id && jarvisConfig.google?.client_secret
-      ? `${jarvisConfig.google.client_id}\n${jarvisConfig.google.client_secret}`
-      : null;
+    let lastGoogleCreds = googleIdentity(jarvisConfig);
     settingsReload.registerApplier('google', async (cfg) => {
-      const g = cfg.google;
-      const creds = g?.client_id && g?.client_secret ? `${g.client_id}\n${g.client_secret}` : null;
+      const creds = googleIdentity(cfg);
       if (!creds) {
         googleAuth = null;
       } else if (googleAuth && creds === lastGoogleCreds) {
         googleAuth.reloadTokensFromDisk();
       } else {
-        googleAuth = new GoogleAuth(g!.client_id!, g!.client_secret!);
+        googleAuth = makeGoogleAuth(cfg);
       }
       lastGoogleCreds = creds;
       if (observerService) {
         observerService.setGoogleAuth(googleAuth);
+        // Re-read alongside the auth so the watches are armed from the live
+        // config rather than whatever booted. (The notify secret and channel
+        // token are keyed by the INSTANCE id, which a migration preserves, so
+        // those two do not actually change on a move — the topic and callback
+        // can, if the deployment's config did.)
+        observerService.setPushTargets({
+          pubsubTopic: cfg.google?.pubsub_topic,
+          pushCallback: cfg.google?.push_callback,
+          channelToken: cfg.google?.channel_token,
+        });
         await registry!.stopService('observers');
         await registry!.startService('observers');
       }
@@ -4015,6 +4040,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       goalService: undefined,
       sidecarManager,
       settingsReload,
+      // Lets the hosted push bridge's doorbell poll on demand. `?? undefined`
+      // rather than a cast: when observers are not running there is genuinely
+      // nothing to sync, and the webhook says so.
+      observerService: observerService ?? undefined,
     };
     setCorsOrigin(externalOrigin.httpOrigin);
     wsService.getServer().setCorsOrigin(externalOrigin.httpOrigin);

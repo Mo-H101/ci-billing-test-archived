@@ -15,8 +15,66 @@ export type SystemCronConfig = {
 };
 
 export type GoogleConfig = {
-  client_id: string;
-  client_secret: string;
+  /**
+   * SELF-HOSTED ONLY. Absent on a control-plane managed instance, which holds no
+   * Google client credentials at all — see `refresh_url`. Optional so the
+   * compiler makes every reader face that case instead of trusting a `''`.
+   */
+  client_id?: string;
+  client_secret?: string;
+  /**
+   * HOSTED ONLY (usejarvis, GOOGLE.md "Push bridging"). Present when the control
+   * plane runs a push bridge: Google notifies it, and it rings this instance's
+   * doorbell so a change reflects in seconds instead of on the next poll.
+   *
+   * All three absent = self-hosted, or a deployment with no bridge. Polling then
+   * covers everything, which is the designed fallback rather than a degraded
+   * mode — so nothing here is required and nothing fails without it.
+   */
+  /** HMAC key the inbound doorbell is verified with (per instance). */
+  notify_secret?: string;
+  /** Pub/Sub topic to point Gmail's users.watch at. */
+  pubsub_topic?: string;
+  /** The bridge's public URL, for Calendar's events.watch callback. */
+  push_callback?: string;
+  /**
+   * The token to set on the Calendar watch, which Google echoes back to the
+   * bridge so it can tell which instance a notification belongs to. Rendered
+   * whole by the control plane rather than built here from notify_secret — the
+   * derivation would then live in two codebases, and a drifted token is a
+   * notification the bridge refuses without anything looking wrong.
+   */
+  channel_token?: string;
+  /**
+   * Where the user connects Google, on the hosted account page.
+   *
+   * Its PRESENCE means this instance is control-plane MANAGED: there are no
+   * client credentials in this file at all, the tokens are delivered rather than
+   * obtained here, and this daemon's own OAuth flow must not run — its redirect
+   * URI is this instance's own hostname, which is not registered with Google and
+   * cannot be (there is one registered URI, on the control plane, precisely so a
+   * VPS move does not break it).
+   */
+  connect_url?: string;
+  /**
+   * HMAC key this instance SIGNS its refresh requests with (hosted only).
+   *
+   * A different key from notify_secret, which the DOORBELL is verified with. The
+   * two travel in opposite directions, and while one key served both, the same
+   * signature was valid at either endpoint — safe only because the two body
+   * shapes happen to be disjoint. Both are rendered whole by the control plane.
+   */
+  refresh_secret?: string;
+  /**
+   * Where this instance asks the control plane to refresh its access token.
+   *
+   * Present INSTEAD of client_id/client_secret on a managed instance: the
+   * control plane holds those and applies them on our behalf, so no shared
+   * credential sits in a file this daemon's own (tenant-owned) user can read.
+   */
+  refresh_url?: string;
+  /** This instance's control-plane id, used to name itself when refreshing. */
+  instance_id?: string;
 };
 
 export type ChannelConfig = {

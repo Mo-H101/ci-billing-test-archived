@@ -5,6 +5,7 @@
  * Returns a routes object for Bun.serve().
  */
 
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { HealthMonitor } from './health.ts';
 import { applyApprovalDecision } from './approval-decision.ts';
 import { SecretStorageError } from './section-secrets.ts';
@@ -133,6 +134,15 @@ export type ApiContext = {
   healthMonitor: HealthMonitor;
   agentService: AgentService;
   config: JarvisConfig;
+  /**
+   * Where the Google tokens live. Only set by tests.
+   *
+   * GoogleAuth otherwise resolves this through os.homedir(), which Bun fixes at
+   * process start and no test can redirect — so without this seam the Google
+   * status endpoint reads whatever tokens the machine running the tests happens
+   * to have, and its reconnect/authenticated branches cannot be exercised at all.
+   */
+  googleTokensPath?: string;
   wsService?: WebSocketService;
   channelService?: ChannelService;
   authorityEngine?: AuthorityEngine;
@@ -168,7 +178,21 @@ export type ApiContext = {
    * observers, ...) apply to the running process without a restart.
    */
   settingsReload?: import('./settings-reload.ts').SettingsReloadCoordinator;
+  /**
+   * Observer service, for the hosted push bridge's doorbell to poll on demand.
+   * Absent when observers are not running, which the webhook reports honestly
+   * rather than pretending to have synced.
+   */
+  observerService?: { syncNow(source: 'gmail' | 'calendar'): Promise<string[]> };
 };
+
+/**
+ * How far out of date a push doorbell may be. Generous, because it is bounded by
+ * Pub/Sub's retry window and clock skew between two machines, not by anything
+ * precise — the point is to reject a captured notification replayed hours later,
+ * not to police seconds.
+ */
+const NOTIFY_MAX_SKEW_MS = 5 * 60 * 1000;
 
 // CORS headers — scoped to the dashboard origin, not wildcard
 let CORS: Record<string, string> = {
@@ -2083,27 +2107,86 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/auth/google/status': {
       GET: async () => {
         const googleConfig = ctx.config.google;
-        const hasCredentials = !!(googleConfig?.client_id && googleConfig?.client_secret);
+        const { classifyGoogle, makeGoogleAuth } = await import(
+          '../integrations/google-managed-refresh.ts'
+        );
+        const shape = classifyGoogle(ctx.config);
+        // A MANAGED instance has no client credentials by design — the control
+        // plane holds them and refreshes on its behalf — so "configured" cannot
+        // mean "has credentials" any more, or hosted would always read as
+        // not_configured.
+        const configured = shape.mode !== 'none';
+        // Control-plane managed (GOOGLE.md): the settings UI must show the hosted
+        // Connect button instead of the credentials form, because the account is
+        // connected THROUGH the control plane and this daemon's own OAuth flow
+        // cannot work here.
+        //
+        // From the CLASSIFIER, not from connect_url. Keyed on connect_url alone
+        // this disagreed with `configured` whenever a config had refresh_url and
+        // no connect_url: the instance was managed, refresh and the doorbell
+        // worked, and the tab still rendered the credentials form — whose save
+        // then 409s from the managed guard and whose OAuth button 400s. The
+        // control plane now refuses to boot without the link, and this reads the
+        // same source of truth the auth builder does.
+        const managed = shape.mode === 'managed';
+        const managedFields = managed
+          ? { managed: true as const, connect_url: googleConfig?.connect_url ?? null }
+          : { managed: false as const };
 
-        if (!hasCredentials) {
-          return json({ status: 'not_configured', has_credentials: false, is_authenticated: false, scopes: [], token_expiry: null });
+        if (!configured) {
+          return json({
+            status: 'not_configured',
+            configured: false,
+            is_authenticated: false,
+            scopes: [],
+            token_expiry: null,
+            // A config we REFUSED says why; "no Google here" says nothing.
+            ...(shape.reason ? { reason: shape.reason } : {}),
+            ...managedFields,
+          });
         }
 
         try {
-          const { GoogleAuth } = await import('../integrations/google-auth.ts');
-          const auth = new GoogleAuth(googleConfig!.client_id, googleConfig!.client_secret);
-          const authenticated = auth.isAuthenticated();
-          const tokens = auth.loadTokens();
+          const auth = makeGoogleAuth(ctx.config, undefined, ctx.googleTokensPath);
+          const tokens = auth?.loadTokens() ?? null;
+          // A revoked or expired grant leaves the tokens file exactly where it
+          // was, so "we have tokens" is not "Google works". When the grant is
+          // known to be gone, report NOT authenticated — that is what puts the
+          // Connect button back in front of the user instead of a green
+          // "connected" chip over a dead integration.
+          const reconnect = auth?.reconnectRequired() ?? null;
+          const authenticated = !reconnect && (auth?.isAuthenticated() ?? false);
 
           return json({
-            status: authenticated ? 'connected' : 'credentials_saved',
-            has_credentials: true,
+            // Managed and not yet authenticated is "waiting for the control
+            // plane to deliver", not "save your credentials" — there are none to
+            // save here.
+            status: reconnect
+              ? 'reconnect_required'
+              : authenticated
+                ? 'connected'
+                : managed
+                  ? 'not_connected'
+                  : 'credentials_saved',
+            configured: true,
             is_authenticated: authenticated,
+            ...(reconnect ? { reconnect_reason: reconnect } : {}),
             scopes: ['gmail.readonly', 'calendar.readonly'],
             token_expiry: tokens?.expiry_date ?? null,
+            ...managedFields,
           });
         } catch {
-          return json({ status: 'credentials_saved', has_credentials: true, is_authenticated: false, scopes: [], token_expiry: null });
+          // managedFields is carried here too: dropping it answered
+          // `credentials_saved` with no `managed`, i.e. the self-hosted
+          // credentials form on a hosted box — the same wrong UI as above.
+          return json({
+            status: managed ? 'not_connected' : 'credentials_saved',
+            configured: true,
+            is_authenticated: false,
+            scopes: [],
+            token_expiry: null,
+            ...managedFields,
+          });
         }
       },
     },
@@ -2111,12 +2194,24 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/config/google': {
       POST: async (req: Request) => {
         try {
+          // MANAGED instances must not accept credentials here (GOOGLE.md).
+          // The sibling /api/auth/google/init already refuses; this one did not,
+          // and it REPLACES the whole google section — so one POST from a stale
+          // tab or a curl dropped refresh_url, instance_id and notify_secret
+          // from the running config and persisted a row that then won on every
+          // reload: refresh dead, doorbell 404, managed UI gone. Silently.
+          const { classifyGoogle } = await import('../integrations/google-managed-refresh.ts');
+          if (classifyGoogle(ctx.config).mode === 'managed' || ctx.config.google?.refresh_url) {
+            return error(
+              'This instance is managed by usejarvis — its Google credentials are held by the control plane and cannot be set here.',
+              409,
+            );
+          }
           const body = await req.json() as { client_id: string; client_secret: string };
           if (!body.client_id || !body.client_secret) {
             return error('Missing client_id or client_secret');
           }
 
-          const { saveUserSection } = await import('./user-settings.ts');
           const freshConfig = ctx.config;
           freshConfig.google = { client_id: body.client_id, client_secret: body.client_secret };
           const { saveGoogleSettings } = await import('./user-settings.ts');
@@ -2136,6 +2231,18 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     '/api/auth/google/init': {
       POST: async () => {
         const googleConfig = ctx.config.google;
+        // MANAGED instances must not run this flow (GOOGLE.md). Its redirect URI
+        // is this instance's own hostname, which is not registered with Google —
+        // there is exactly ONE registered URI, on the control plane, precisely so
+        // that moving to another host does not break it. Starting the flow here
+        // therefore ends at a redirect_uri_mismatch error page, so it is refused
+        // at the API rather than only hidden in the UI.
+        if (googleConfig?.connect_url) {
+          return error(
+            `This instance is managed by usejarvis — connect Google from ${googleConfig.connect_url}`,
+            409,
+          );
+        }
         if (!googleConfig?.client_id || !googleConfig?.client_secret) {
           return error('Google credentials not configured. Save client_id and client_secret first.', 400);
         }
@@ -2159,6 +2266,70 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const msg = err instanceof Error ? err.message : String(err);
           return error(`Failed to generate auth URL: ${msg}`, 500);
         }
+      },
+    },
+
+
+    /**
+     * The push bridge's doorbell (GOOGLE.md "Push bridging"). HOSTED ONLY.
+     *
+     * PUBLIC route, deliberately, and it has to be: the caller is the control
+     * plane, which holds no enrolled-device token and must not. It lives under
+     * `/api/webhooks/` because that prefix is already the public, signature-
+     * verified machine-to-machine surface (see isPublicRoute) — inventing a new
+     * exception for one route would widen the unauthenticated surface for no
+     * reason. Two path segments so it cannot be confused with the workflow
+     * webhook ingress at `/api/webhooks/:flowId`.
+     *
+     * Authentication is the HMAC over the exact body, keyed by the per-instance
+     * notify_secret from the system config. Constant-time compared: this is a MAC
+     * check on attacker-supplied input, and a byte-by-byte early exit is what a
+     * forgery attempt measures.
+     *
+     * The body is a DOORBELL — `{source, at}`, no data — so the worst a forged
+     * one achieves is an early poll. That is why the answer is deliberately
+     * uninformative about which instance or address exists.
+     */
+    '/api/webhooks/google/notify': {
+      POST: async (req: Request) => {
+        const secret = ctx.config.google?.notify_secret;
+        // No secret configured = self-hosted, or a hosted instance whose config
+        // predates the bridge. Nothing can be verified, so nothing is accepted.
+        if (!secret) return error('not configured', 404);
+
+        const raw = await req.text();
+        const { INSTANCE_SIGNATURE_HEADER, verifyWithSecret } = await import(
+          '../integrations/google-signature.ts'
+        );
+        // Byte-length compare, via the shared helper: the hand-rolled version
+        // here gated on String.length, so a 64-CHARACTER non-ASCII signature got
+        // past it and made timingSafeEqual throw — a 500 with a stack instead of
+        // a 401, from any unauthenticated caller, on a deliberately public route.
+        if (!verifyWithSecret(secret, raw, req.headers.get(INSTANCE_SIGNATURE_HEADER))) {
+          return error('bad signature', 401);
+        }
+
+        let source: 'gmail' | 'calendar' | null = null;
+        let at = 0;
+        try {
+          const body = JSON.parse(raw) as { source?: unknown; at?: unknown };
+          if (body.source === 'gmail' || body.source === 'calendar') source = body.source;
+          if (typeof body.at === 'string') at = Date.parse(body.at);
+        } catch {
+          return error('bad body', 400);
+        }
+        if (!source) return error('bad body', 400);
+        // The timestamp is INSIDE the signed bytes, so a replayed doorbell can be
+        // rejected without keeping a nonce store: an old one is either a retry
+        // long past being useful or a capture being replayed, and the poll timer
+        // covers anything genuinely missed.
+        if (!Number.isFinite(at) || Math.abs(Date.now() - at) > NOTIFY_MAX_SKEW_MS) {
+          return error('stale', 400);
+        }
+
+        if (!ctx.observerService) return json({ ok: true, synced: [] });
+        const synced = await ctx.observerService.syncNow(source);
+        return json({ ok: true, synced });
       },
     },
 
