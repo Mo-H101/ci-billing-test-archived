@@ -17,6 +17,12 @@
  */
 
 import type { JarvisConfig, LLMProviderEntry, LLMProviderKind } from '../config/types.ts';
+import {
+  applyUsejarvisAi,
+  effectiveLlmForBinding,
+  hasUsejarvisAi,
+  USEJARVIS_PROVIDER_NAME,
+} from './usejarvis-ai.ts';
 import { getSetting, setSetting } from '../vault/settings.ts';
 import { getSecret, setSecret, deleteSecret, hasSecret } from '../vault/keychain.ts';
 import type { LLMManager } from '../llm/manager.ts';
@@ -208,6 +214,19 @@ export function saveLLMSettings(
     // would otherwise leave earlier entries applied in memory but never
     // persisted by the setSetting() block at the end of this function.
     for (const [name, update] of updates) {
+      // SYSTEM-owned: on hosted installs an edit/delete of the reserved name
+      // is refused loudly (a silent skip reported "saved" for a no-op). The
+      // throw lives HERE in the validation loop so a rejected batch mutates
+      // nothing. On self-hosted installs (no block) the legacy silent-skip
+      // stands until the reservation is gated on hostedness.
+      if (name === USEJARVIS_PROVIDER_NAME) {
+        if (hasUsejarvisAi(config)) {
+          throw new Error(
+            `Provider '${USEJARVIS_PROVIDER_NAME}' is managed by your hosting plan and cannot be edited or deleted`,
+          );
+        }
+        continue;
+      }
       if (update === null) continue;
       const existing = config.llm.providers[name] ?? {};
       const nextBaseUrl = normalizeBaseUrl(update.base_url);
@@ -238,6 +257,10 @@ export function saveLLMSettings(
       }
     }
     for (const [name, update] of updates) {
+      // The hosted provider is SYSTEM-owned (config.yaml carve-out): the
+      // dashboard can neither create, edit, nor delete it, and nothing under
+      // the reserved name may reach the DB or keychain.
+      if (name === USEJARVIS_PROVIDER_NAME) continue;
       if (update === null) {
         delete config.llm.providers[name];
         // Drop every model ref the provider owned. The manager prunes its own
@@ -336,6 +359,10 @@ export function stripSecretsFromProviders(
   const out: Record<string, LLMProviderEntry> = {};
   for (const [name, entry] of Object.entries(providers ?? {})) {
     if (!entry) continue;
+    // The hosted provider is INJECTED from config.yaml on every merge — it
+    // must never round-trip into the persisted DB shape (it would survive
+    // un-hosting and shadow the file as a stale copy).
+    if (name === USEJARVIS_PROVIDER_NAME) continue;
     const { api_key: _omit, ...rest } = entry;
     void _omit;
     out[name] = rest;
@@ -402,7 +429,15 @@ export function mergeLLMSettingsIntoConfig(
     config.llm.prompt_cache = storedPromptCache !== 'false';
   }
 
-  // 2. Legacy shape: migrate per-provider DB keys + KEY_* secrets if any
+  // 2. Hosted installs: inject the usejarvis_ai provider from the config.yaml
+  // block BEFORE the legacy migration and the orphan prune below. The prune
+  // decides "orphan" by looking the ref's provider up in config.llm.providers;
+  // injecting afterwards made every persisted usejarvis_ai:* ref look dangling
+  // and PERSISTED its deletion — a hosted user's explicit tier/default choices
+  // were erased on every boot.
+  applyUsejarvisAi(config);
+
+  // 3. Legacy shape: migrate per-provider DB keys + KEY_* secrets if any
   // are present and no new-shape providers exist for them. This is the
   // upgrade path for installs that pre-date the provider/model split.
   migrateLegacyDBSettings(config);
@@ -414,12 +449,15 @@ export function mergeLLMSettingsIntoConfig(
     pruneOrphanedModelRefs(config, options.persistMigrations !== false);
   }
 
-  // 3. Pull API keys from the keychain into provider entries. We do NOT
+  // 4. Pull API keys from the keychain into provider entries. We do NOT
   // surface them in `config.llm.providers.<name>.api_key` (that would risk
   // saving them back to disk) - instead the config-binding module reads
   // from the keychain at provider-instantiation time. So this step only
   // ensures entries exist for any name with a keychain secret.
   for (const name of Object.keys(config.llm.providers)) {
+    // The hosted provider's credential comes from the config.yaml block only;
+    // a keychain entry squatting on the reserved name must not shadow it.
+    if (name === USEJARVIS_PROVIDER_NAME) continue;
     const key = getSecret(keychainKey(name));
     if (key) {
       // Inject into the entry transiently so registerLLMProviders can
@@ -585,6 +623,9 @@ function migrateLegacyDBSettings(config: JarvisConfig): void {
  * underlying replaceProviders/setTierMap operations are atomic.
  */
 export function hotReloadLLMProviders(config: JarvisConfig, llmManager: LLMManager): void {
+  // Idempotent: a dashboard save rebuilds config.llm from the request before
+  // calling this — the hosted provider must survive that too.
+  applyUsejarvisAi(config);
   // Build enriched entries with keychain secrets injected so providers can
   // instantiate. The injection is transient - only the in-memory entries
   // see it; persisted forms (DB / YAML) get stripped via
@@ -606,7 +647,9 @@ export function hotReloadLLMProviders(config: JarvisConfig, llmManager: LLMManag
   if (built.length === 0) {
     console.warn('[LLM] Hot-reload: no providers registered (all entries missing credentials).');
   }
-  configureLLMTiers(llmManager, config.llm);
+  // Bind through the effective view: hosted tier defaults exist ONLY here,
+  // never in config.llm, so no save path can accidentally persist them.
+  configureLLMTiers(llmManager, effectiveLlmForBinding(config));
 
   console.log(`[LLM] Providers active after hot-reload: ${built.map((p) => p.name).join(', ') || 'none'}`);
 }
