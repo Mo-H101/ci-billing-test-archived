@@ -100,6 +100,7 @@ let workflowWorker: WorkflowWorker | null = null;
 let triggerManager: TriggerManager | null = null;
 let workflowEngineShutdown: (() => Promise<void>) | null = null;
 let systemCron: import('./system-cron.ts').SystemCronService | null = null;
+let usageAlerts: import('./usage-alerts-service.ts').UsageAlertsService | null = null;
 let timerScheduler: TimerWaitpointScheduler | null = null;
 let settingsReload: import('./settings-reload.ts').SettingsReloadCoordinator | null = null;
 /** Set once the sidecar manager is up; re-pushes the pebble realtime
@@ -220,6 +221,12 @@ async function handleShutdown(signal: string): Promise<void> {
     if (systemCron) {
       systemCron.stop();
       systemCron = null;
+    }
+
+    // Stop the hosted usage threshold check
+    if (usageAlerts) {
+      usageAlerts.stop();
+      usageAlerts = null;
     }
 
     // Stop commitment executor
@@ -4157,6 +4164,28 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const { SystemCronService } = await import('./system-cron.ts');
     systemCron = new SystemCronService(sharedEventBus, jarvisConfig.cron);
     systemCron.start();
+
+    // Hosted usage warnings: three-quarters used, and used up, for each of the
+    // two windows the proxy enforces. Registered even on a self-hosted install
+    // — the reader answers null there, so the pass is a no-op and costs one
+    // config read every 15 minutes, which is cheaper than deciding whether to
+    // register it from a config that can change under SIGHUP.
+    const { UsageAlertsService } = await import('./usage-alerts-service.ts');
+    usageAlerts = new UsageAlertsService({
+      getConfig: () => jarvisConfig,
+      notify: notifyAll,
+      canNotify: () => sidecarManager.getConnectedSidecars().length > 0,
+    });
+    usageAlerts.start();
+    // A pass with no sidecar connected leaves its flags unset on purpose, so
+    // the warning survives — but it would then wait up to fifteen minutes for
+    // the next tick. Re-check as soon as a machine appears, which is exactly
+    // when someone is there to read it. The 60s reader cache makes a reconnect
+    // storm cost one upstream request, and the flags make a duplicate pass a
+    // no-op.
+    sidecarManager.onSidecarConnected(() => {
+      void usageAlerts?.check().catch(() => {});
+    });
 
     // Bootstrap the workflow engine: build/locate the bundle, compile pieces,
     // start the loopback SandboxApi, construct the EngineRuntime, extract the
