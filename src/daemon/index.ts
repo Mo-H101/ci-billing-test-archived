@@ -22,8 +22,9 @@ import { createObservation } from "../vault/observations.ts";
 import { ObserverService, mapEventType } from "./observer-service.ts";
 import { WebSocketService } from "./ws-service.ts";
 import { PebbleRealtimeManager } from "./pebble-realtime.ts";
-import { hostedRealtimeIncluded } from './realtime-gate.ts';
+import { hostedRealtimeIncluded, warmRealtimeGateFor } from './realtime-gate.ts';
 import { resolveRealtimeVoice } from "../config/realtime.ts";
+import { realtimeEnablement } from "./usejarvis-ai.ts";
 import { REALTIME_NAV_TOOLS, REALTIME_NAV_TOOL_NAMES } from "./realtime-nav-tools.ts";
 import { EventReactor } from "./event-reactor.ts";
 import { EventCoalescer } from "./event-coalescer.ts";
@@ -809,7 +810,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         dispatchRPC: (sidecarId, method, params) => sidecarManager.dispatchRPC(sidecarId, method, params ?? {}),
         dispatchNotify: (sidecarId, method, params) => sidecarManager.dispatchNotify(sidecarId, method, params ?? {}),
         getAudioChannel: (sidecarId) => sidecarManager.getAudioChannel(sidecarId),
-        resolve: () => resolveRealtimeVoice(agentService.getConfig()),
+        resolve: () => {
+          const cfg = agentService.getConfig();
+          return resolveRealtimeVoice(cfg, realtimeEnablement(cfg));
+        },
         // Agent tools + the nav tools (open_dashboard_room, …) so realtime voice
         // can drive the desktop UI just like the one-shot path ("open settings").
         tools: () => [...agentService.getOrchestrator().getRealtimeTools(), ...REALTIME_NAV_TOOLS],
@@ -842,7 +846,8 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // Tell each pebble-capable sidecar whether realtime is available so its
       // summon hotkey knows to toggle a live session vs. the one-shot capture.
       const advertiseRealtime = async (sidecarId: string) => {
-        const res = resolveRealtimeVoice(agentService.getConfig());
+        const cfg = agentService.getConfig();
+        const res = resolveRealtimeVoice(cfg, realtimeEnablement(cfg));
         // The advertisement must agree with the starters' plan gate, or the
         // summon hotkey opens sessions the plan refuses at dial.
         const enabled = res.ok && (await hostedRealtimeIncluded(res.resolved));
@@ -4242,6 +4247,25 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     sidecarManager.onSidecarConnected(() => {
       void usageAlerts?.check().catch(() => {});
     });
+
+    // Prime the realtime plan verdict before anyone speaks. Realtime is now on
+    // by default for hosted tenants, so the gate decides for every hosted
+    // install — and with a cold cache GET /api/config/voice reports
+    // "available", which puts the browser into raw-PCM capture. On a plan
+    // WITHOUT realtime that first utterance is refused and its frames dropped,
+    // so the user speaks and nothing happens. One catalog request at boot
+    // removes it, and it is issued here — well before registry.startAll()
+    // binds any listener — so the dashboard's first poll already has a verdict.
+    const warmRealtime = () => warmRealtimeGateFor(() => {
+      const rtCfg = agentService.getConfig();
+      return resolveRealtimeVoice(rtCfg, realtimeEnablement(rtCfg));
+    });
+    warmRealtime();
+    // And again after every SIGHUP reload, which clears the verdict cache. A
+    // reload arriving BEFORE this line is registered simply has no warm; the
+    // miss-triggered fetch in cachedRealtimeVerdict covers that gap, which is
+    // why that fetch exists rather than warming being the only defence.
+    settingsReload.setWarmRealtime(warmRealtime);
 
     // Bootstrap the workflow engine: build/locate the bundle, compile pieces,
     // start the loopback SandboxApi, construct the EngineRuntime, extract the
