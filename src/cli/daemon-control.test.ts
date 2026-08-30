@@ -34,7 +34,7 @@ async function spawnSupervisedReplacement(): Promise<ReturnType<typeof Bun.spawn
   const script = join(DATA_DIR, `replacement-${stamp}.ts`);
 
   // The first acquireLock attempt is expected to FAIL (the original still holds
-  // the lock) — its purpose is to pay the one-time TinyCC compile of flock.c
+  // the lock) — its purpose is to pay the one-time libc dlopen (pid.ts:getFlock)
   // before we signal "spinning", so the replacement can win the lock inside a
   // single poll interval rather than racing a cold start against it.
   await Bun.write(script, `

@@ -20,8 +20,7 @@ import {
   writeSync,
   ftruncateSync,
 } from 'node:fs';
-import { cc } from 'bun:ffi';
-import flockSource from './flock.c' with { type: 'file' };
+import { dlopen } from 'bun:ffi';
 
 const JARVIS_DIR = join(homedir(), '.jarvis');
 
@@ -53,22 +52,82 @@ export function lockPathFor(dataDir?: string): string {
   return join(dataDir, 'jarvis.pid');
 }
 
-// ── flock() via Bun cc() ────────────────────────────────────────────
-// Compiled lazily on first use by Bun's embedded TinyCC. Resolves libc
-// via system headers — works on Linux, macOS, and any POSIX platform
-// without hardcoding a shared library path.
+// ── flock() via dlopen of the platform libc ─────────────────────────
+// flock() is a POSIX system call exported by whatever libc Bun already
+// loads, so the daemon dlopens it directly — no C compiler, no dev
+// headers, nothing compiled or written to disk. Compiling a helper would
+// drag a build-essential-scale toolchain onto production daemon hosts for
+// zero benefit, and it is exactly what broke under Ubuntu's multiarch
+// include layout (`/usr/include/<triplet>/sys/file.h`) with TinyCC. The
+// hard part of loading libc is only its name: on glibc Linux it is
+// `libc.so.6`, on Alpine/musl `libc.musl-<triplet>.so.1` (or the `libc.so`
+// alias musl ships), and on macOS `libSystem.B.dylib` — all resolved by
+// `flockLibcCandidates` below.
 //
-// Compilation is deferred (not run at module load) so that importing
-// this module's pure-fs helpers stays safe on platforms where the helper
-// can't be built. On native Windows the daemon is unsupported, and the C
-// source depends on POSIX headers that don't exist there — guarding here
-// surfaces a clear message instead of a low-level TinyCC header error.
+// Loading is deferred (not done at module load) so importing this module's
+// pure-fs helpers stays side-effect free. On native Windows the daemon is
+// unsupported anyway; the guard in `getFlock` surfaces that clearly instead
+// of a low-level dlopen error.
+
+const FLOCK_FLOCK = { args: ['i32', 'i32'], returns: 'i32' } as const;
 
 type FlockSymbols = {
-  do_flock: (fd: number, operation: number) => number;
+  flock: (fd: number, operation: number) => number;
 };
 
 let flockSymbols: FlockSymbols | null = null;
+
+/**
+ * Libc sonames to try for `flock`, most likely first per platform. The musl
+ * names are architecture-tagged (`libc.musl-<triplet>.so.1`); `libc.so` is
+ * the generic alias musl >= 1.1.11 installs and glibc also ships, so it also
+ * serves as the fallback for unusual arch strings. Pure so tests can pin the
+ * macOS/musl coverage on any host.
+ */
+export function flockLibcCandidatesFor(platform: NodeJS.Platform, arch: string): string[] {
+  switch (platform) {
+    case 'darwin':
+      return ['libSystem.B.dylib', 'libc.dylib'];
+    case 'freebsd':
+      return ['libc.so.7'];
+    case 'win32':
+      return [];
+    default: {
+      const musl: Record<string, string> = {
+        x64: 'libc.musl-x86_64.so.1',
+        arm64: 'libc.musl-aarch64.so.1',
+        arm: 'libc.musl-armhf.so.1',
+        riscv64: 'libc.musl-riscv64.so.1',
+      };
+      return [musl[arch], 'libc.so.6', 'libc.so'].filter(
+        (name): name is string => name !== undefined,
+      );
+    }
+  }
+}
+
+export function flockLibcCandidates(): string[] {
+  return flockLibcCandidatesFor(process.platform, process.arch);
+}
+
+/**
+ * Load `flock` from the first candidate that exposes it. Exported for tests:
+ * a forced-bad candidate list must fail with a clear message.
+ */
+export function resolveFlockSymbols(candidates: string[]): FlockSymbols {
+  let lastError: unknown;
+  for (const name of candidates) {
+    try {
+      const lib = dlopen(name, { flock: FLOCK_FLOCK });
+      return lib.symbols as FlockSymbols;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw new Error(
+    `The JARVIS daemon could not load flock() from the system libc (tried ${candidates.join(', ')}): ${lastError}`,
+  );
+}
 
 function getFlock(): FlockSymbols {
   if (process.platform === 'win32') {
@@ -77,13 +136,7 @@ function getFlock(): FlockSymbols {
     );
   }
   if (flockSymbols === null) {
-    const { symbols } = cc({
-      source: flockSource,
-      symbols: {
-        do_flock: { args: ['i32', 'i32'], returns: 'i32' },
-      },
-    });
-    flockSymbols = symbols as FlockSymbols;
+    flockSymbols = resolveFlockSymbols(flockLibcCandidates());
   }
   return flockSymbols;
 }
@@ -117,7 +170,7 @@ export function acquireLock(pid: number): boolean {
     const fd = openSync(defaultLockPath(), constants.O_WRONLY | constants.O_CREAT, 0o644);
 
     // Try non-blocking exclusive lock
-    const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
+    const result = flock.flock(fd, LOCK_EX | LOCK_NB);
     if (result !== 0) {
       closeSync(fd);
       return false;
@@ -156,10 +209,10 @@ export function isLocked(lockPath: string = defaultLockPath()): number | null {
 
   try {
     // Try non-blocking exclusive lock to probe
-    const result = getFlock().do_flock(fd, LOCK_EX | LOCK_NB);
+    const result = getFlock().flock(fd, LOCK_EX | LOCK_NB);
     if (result === 0) {
       // Lock acquired — no daemon running. Release immediately.
-      getFlock().do_flock(fd, LOCK_UN);
+      getFlock().flock(fd, LOCK_UN);
       closeSync(fd);
       return null;
     }
@@ -198,7 +251,7 @@ export function acquireLockAt(lockPath: string, pid: number): { release: () => v
     const flock = getFlock();
     mkdirSync(join(lockPath, '..'), { recursive: true });
     const fd = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT, 0o644);
-    const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
+    const result = flock.flock(fd, LOCK_EX | LOCK_NB);
     if (result !== 0) {
       closeSync(fd);
       return null;
@@ -276,12 +329,12 @@ export function releaseLockIfUnheld(): boolean {
 
   try {
     const flock = getFlock();
-    if (flock.do_flock(fd, LOCK_EX | LOCK_NB) !== 0) {
+    if (flock.flock(fd, LOCK_EX | LOCK_NB) !== 0) {
       closeSync(fd);
       return false; // someone holds it
     }
     try { unlinkSync(lockPath); } catch { /* already gone */ }
-    flock.do_flock(fd, LOCK_UN);
+    flock.flock(fd, LOCK_UN);
     closeSync(fd);
     return true;
   } catch {

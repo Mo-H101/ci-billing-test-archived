@@ -13,6 +13,9 @@ import {
   getLogPath,
   getLogDir,
   releaseLockIfUnheld,
+  flockLibcCandidates,
+  flockLibcCandidatesFor,
+  resolveFlockSymbols,
 } from './pid.ts';
 
 // The lock lives at `JARVIS_HOME`/jarvis.pid, resolved per call (see
@@ -75,9 +78,9 @@ await Bun.sleep(60000);
     catch { return '<no stderr>'; }
   };
 
-  // 15s, not 5s: the child pays for a cold `bun` start AND the one-time TinyCC
-  // compile of flock.c (pid.ts:getFlock). On a loaded 2-core runner that can
-  // take several seconds on its own, and a timeout here read as a real bug.
+  // 15s, not 5s: the child pays for a cold `bun` start AND the one-time libc
+  // dlopen (pid.ts:getFlock). On a loaded 2-core runner that can take several
+  // seconds on its own, and a timeout here read as a real bug.
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     await Bun.sleep(50);
@@ -485,11 +488,11 @@ describe('Process Lock Manager', () => {
 
   // ── native Windows guard (#252) ──────────────────────────────────
   //
-  // On native Windows the daemon is unsupported and `flock.c` (POSIX-only)
-  // cannot be compiled. The cc() compile must be deferred so importing the
-  // module never crashes before the CLI's platform guard fires, and any
-  // flock path that *is* reached must surface a clear message rather than a
-  // low-level TinyCC `sys/file.h not found` error.
+  // On native Windows the daemon is unsupported and there is no POSIX libc
+  // to dlopen flock() from. Loading must be deferred so importing the module
+  // never crashes before the CLI's platform guard fires, and any flock path
+  // that *is* reached must surface a clear message instead of a low-level
+  // dlopen error.
 
   describe('native Windows guard', () => {
     const PROBE_SCRIPT = join(tmpdir(), 'jarvis-test-win32-probe.ts');
@@ -519,9 +522,9 @@ ${body}
       return { stdout, stderr, exitCode };
     }
 
-    // Smoke test only: on a POSIX CI host `<sys/file.h>` exists, so even the
-    // pre-fix eager compile would succeed here — this can only truly fail on
-    // real Windows. The genuine regression guard is the next test.
+    // Smoke test only: deferred libc resolution means importing the module is
+    // side-effect free everywhere — this only ties the door shut on the
+    // deferral contract. The genuine regression guard is the next test.
     test('importing the module is side-effect-free (smoke)', async () => {
       const { stdout, stderr, exitCode } = await runOnFakeWin32(`
 await import(${JSON.stringify(PID_MODULE)});
@@ -532,20 +535,115 @@ console.log('IMPORT_OK');
       expect(stderr).not.toContain('sys/file.h');
     }, { timeout: 15000 });
 
-    // Real regression guard: pre-fix, `acquireLock` ran the eager-compiled
-    // flock against the real POSIX libc (no win32 guard existed), so stderr
-    // would NOT contain the support message — this test fails on the old code.
-    test('acquireLock surfaces a clear unsupported message, not a TinyCC error', async () => {
+    // Real regression guard: without the win32 guard, `acquireLock` would hit
+    // getFlock and surface a low-level dlopen failure — stderr would NOT
+    // contain the support message. This test fails on the old code.
+    test('acquireLock surfaces a clear unsupported message, not a low-level dlopen error', async () => {
       const { stderr, exitCode } = await runOnFakeWin32(`
 const { acquireLock } = await import(${JSON.stringify(PID_MODULE)});
 const ok = acquireLock(process.pid);
 console.log('ACQUIRE=' + ok);
 `);
       expect(exitCode).toBe(0);
-      // The clear, immediate daemon-support message — not a TinyCC header error.
+      // The clear, immediate daemon-support message — not a loader error.
       expect(stderr).toContain('not compatible with native Windows');
       expect(stderr).toContain('WSL2 or Docker');
       expect(stderr).not.toContain('sys/file.h');
     }, { timeout: 15000 });
+  });
+
+  // ── runtime libc dlopen ───────────────────────────────────────────
+  //
+  // flock() is resolved at runtime from the platform's libc via bun:ffi
+  // dlopen (pid.ts:resolveFlockSymbols) — no C compiler, no headers, no disk
+  // writes. The cold-import probe below is the regression guard for the
+  // Ubuntu multiarch `sys/file.h` breakage that compiling a helper caused;
+  // the resolver/candidate tests pin the clear failure message and the
+  // cross-platform soname table (macOS, musl) on any host.
+
+  describe('runtime libc dlopen', () => {
+    const PROBE_SCRIPT = join(tmpdir(), 'jarvis-test-flock-probe.ts');
+    const PROBE_HOME = join(tmpdir(), 'jarvis-test-flock-home');
+
+    afterEach(() => {
+      try { unlinkSync(PROBE_SCRIPT); } catch {}
+      try { rmSync(PROBE_HOME, { recursive: true, force: true }); } catch {}
+    });
+
+    /** Run a snippet in a fresh child process (cold import, isolated HOME). */
+    async function runProbe(body: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+      writeFileSync(PROBE_SCRIPT, body);
+      const proc = Bun.spawn([process.execPath, PROBE_SCRIPT], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // Isolate from the real ~/.jarvis so the probe can't touch a live lock.
+        env: { ...process.env, HOME: PROBE_HOME, USERPROFILE: PROBE_HOME },
+      });
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      const exitCode = await proc.exited;
+      return { stdout, stderr, exitCode };
+    }
+
+    // Regression guard for the Ubuntu/glibc multiarch case that motivated the
+    // whole review: when the helper was COMPILED at runtime, this host failed
+    // with `sys/file.h not found` because TinyCC misses the multiarch include
+    // layout. Loading flock() straight from the libc the process already
+    // loads needs no compiler and no headers at all — a cold import must
+    // acquire the lock in a fresh child with PATH and HOME both minimal.
+    test('acquires the lock in a fresh process by dlopening the libc', async () => {
+      const { stdout, stderr, exitCode } = await runProbe(`
+const { acquireLock } = await import(${JSON.stringify(PID_MODULE)});
+console.log('IMPORT_OK');
+const ok = acquireLock(process.pid);
+console.log('ACQUIRE=' + ok);
+`);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain('IMPORT_OK');
+      expect(stdout).toContain('ACQUIRE=true');
+      expect(stderr).not.toContain('sys/file.h');
+      expect(stderr).not.toContain('C compiler');
+    }, { timeout: 15000 });
+
+    test('the host libc resolves flock through the candidate table', () => {
+      expect(() => resolveFlockSymbols(flockLibcCandidates())).not.toThrow();
+    });
+
+    // A resolver that can't find flock anywhere must surface the candidate
+    // list it tried and stop the daemon, not crash with a loader error.
+    test('fails clearly when no libc candidate exposes flock', () => {
+      const candidates = ['/nonexistent/libc-jarvis-probe.so', 'libc-jarvis-missing.so.9'];
+      let threw = false;
+      try {
+        resolveFlockSymbols(candidates);
+      } catch (err) {
+        threw = true;
+        const msg = String(err);
+        expect(msg).toContain('could not load flock()');
+        expect(msg).toContain('tried /nonexistent/libc-jarvis-probe.so');
+      }
+      expect(threw).toBe(true);
+    });
+
+    // Pin the soname table on ANY host so the macOS and musl coverage can't
+    // silently rot from a Linux-only CI view.
+    test('candidate table covers glibc, musl, and macOS sonames', () => {
+      // glibc (Debian/Ubuntu, Fedora, proot environments, WSL2, Docker)
+      expect(flockLibcCandidatesFor('linux', 'x64')).toContain('libc.so.6');
+      expect(flockLibcCandidatesFor('linux', 'arm64')).toContain('libc.so.6');
+      // musl (Alpine) — arch-tagged names
+      expect(flockLibcCandidatesFor('linux', 'x64')).toContain('libc.musl-x86_64.so.1');
+      expect(flockLibcCandidatesFor('linux', 'arm64')).toContain('libc.musl-aarch64.so.1');
+      expect(flockLibcCandidatesFor('linux', 'arm')).toContain('libc.musl-armhf.so.1');
+      expect(flockLibcCandidatesFor('linux', 'riscv64')).toContain('libc.musl-riscv64.so.1');
+      // generic fallback alias worn by both musl and glibc
+      expect(flockLibcCandidatesFor('linux', 'x64')).toContain('libc.so');
+      // macOS
+      expect(flockLibcCandidatesFor('darwin', 'arm64')[0]).toBe('libSystem.B.dylib');
+      expect(flockLibcCandidatesFor('darwin', 'x64')).toContain('libc.dylib');
+      // win32: nothing to resolve — the win32 guard fires first
+      expect(flockLibcCandidatesFor('win32', 'x64')).toEqual([]);
+    });
   });
 });

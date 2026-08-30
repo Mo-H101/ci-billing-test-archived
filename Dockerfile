@@ -2,9 +2,8 @@
 #
 # Multi-stage build for the JARVIS daemon.
 # Uses the Debian-based Bun images (`oven/bun:1`, the default tag) rather than
-# the Alpine variants. Nothing in the tree needs glibc today — there are no
-# native addons left after sharp was dropped — so this is just the default,
-# not a constraint; Alpine is a fair option if an image-size push wants it.
+# the Alpine variants: the production stage installs `ca-certificates`, `git`,
+# `make`, and `procps` via apt-get, so the base must be Debian-based.
 #
 # Build:   docker build -t jarvis .
 # Build with version: docker build --build-arg VERSION=0.3.1 -t jarvis .
@@ -69,7 +68,7 @@ FROM oven/bun:1-slim AS production
 # ca-certificates: HTTPS calls to LLM APIs
 # git: required by the Site Builder for project version control
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates git make procps libc-dev && \
+    apt-get install -y --no-install-recommends ca-certificates git make procps && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
